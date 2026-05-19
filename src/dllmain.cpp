@@ -18,7 +18,7 @@ public:
     PalAccessibilityMod() : CppUserModBase() {
         ModName        = STR("PalAccessibility");
         ModVersion     = STR("0.1.0");
-        ModAuthors     = STR("remikhaugen");
+        ModAuthors     = STR("nordanc");
         ModDescription = STR("Screen-reader (NVDA / Tolk) and accessibility support for Palworld.");
         Output::send<LogLevel::Default>(STR("[PalAccess] constructed\n"));
     }
