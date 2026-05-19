@@ -1,0 +1,26 @@
+# Build output
+build/
+out/
+.vs/
+.vscode/
+*.user
+*.suo
+*.aps
+*.ipdb
+*.iobj
+*.pdb
+CMakeUserPresets.json
+
+# UE4SS upstream — cloned by scripts/fetch-ue4ss.bat. Not redistributed in
+# this repo because building it requires Epic-Games-linked GitHub access to
+# the UEPseudo submodule.
+third_party/RE-UE4SS/
+
+# Tolk runtime DLLs ARE tracked (third_party/tolk/*.dll, *.lib) so users
+# can build without rebuilding Tolk. They are LGPLv3 redistributables.
+
+# Crash dumps / IDE scratch
+*.dmp
+*.log
+.cache/
+.idea/
