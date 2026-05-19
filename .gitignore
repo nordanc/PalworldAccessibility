@@ -24,3 +24,7 @@ third_party/RE-UE4SS/
 *.log
 .cache/
 .idea/
+
+# Release packaging scratch (zip + staging tree)
+release-staging/
+PalAccessibility-*.zip

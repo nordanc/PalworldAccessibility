@@ -8,20 +8,6 @@ read `BUILD.md` instead.
 The whole setup is six steps and takes about ten minutes the first time.
 After that the mod loads automatically every time you start Palworld.
 
-## Note on alpha 1
-
-Alpha 1 of this mod is currently shipped as source code only. A prebuilt
-`main.dll` is not yet attached to the GitHub release. Until alpha 2 lands,
-the steps below assume you either:
-
-1. Wait for alpha 2, which will include a ready-to-use binary, or
-2. Ask a sighted friend or developer to build it for you using `BUILD.md`
-   and send you the resulting `main.dll`.
-
-Everything else in this guide — installing NVDA, installing UE4SS,
-copying files into place, enabling the mod — is the same regardless of
-whether you compiled the DLL yourself or someone handed it to you.
-
 ## What this mod does
 
 It makes Palworld talk through your screen reader. Menus, settings, the
@@ -83,24 +69,28 @@ Close the game once you see that file appear.
 
 Go to the releases page at
 `https://github.com/nordanc/PalworldAccessibility/releases/latest` and
-download the release asset for the current alpha. When alpha 2 is out
-this will be a zip called `PalAccessibility-alpha-2.zip` or similar.
+download the file called `PalAccessibility-alpha-2.zip` from the
+"Assets" section of the most recent release.
 
-Inside the zip you will find a folder called `PalAccessibility` and
-three Tolk runtime DLLs.
+The zip is laid out to mirror the Palworld install directory, so the
+fastest install is to extract it straight into your Palworld root.
+On a default Steam install that is:
 
-Copy the three runtime DLLs — `Tolk.dll`, `nvdaControllerClient64.dll`,
-and `SAAPI64.dll` — into the same Win64 folder as `dwmapi.dll`. They
-have to live next to `Palworld-Win64-Shipping.exe` so Windows can find
-them when the mod loads.
+`C:\Program Files (x86)\Steam\steamapps\common\Palworld\`
 
-Copy the `PalAccessibility` folder into the `Mods` folder that UE4SS
-created. The full path of the destination should be:
+Extract there and the files land in the right places automatically:
 
-`C:\Program Files (x86)\Steam\steamapps\common\Palworld\Pal\Binaries\Win64\Mods\PalAccessibility\`
+- `navbeakon.wav` goes to the Palworld root (used by the audio beacon)
+- `Tolk.dll`, `nvdaControllerClient64.dll`, and `SAAPI64.dll` land
+  inside `Pal\Binaries\Win64\` next to `Palworld-Win64-Shipping.exe`
+- The `PalAccessibility` mod folder lands inside
+  `Pal\Binaries\Win64\Mods\` next to UE4SS's `mods.txt`
 
-That folder should contain at least a `dlls` subfolder with `main.dll`
-inside it, an `enabled.txt` marker file, and a `Scripts` subfolder.
+If your Palworld is installed somewhere non-standard, extract anywhere
+and then move the contents of the zip's `Pal\` folder into your
+install's `Pal\` folder, and copy `navbeakon.wav` to the install root.
+There is also an `INSTALL.txt` inside the zip with the same layout
+information.
 
 ## Step 4: Enable the mod
 
