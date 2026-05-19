@@ -110,9 +110,16 @@ PalworldAccessibility/
 │   ├── fetch-ue4ss.bat       # Clone RE-UE4SS
 │   └── install-runtime.bat   # Copy Tolk + mod skeleton into the game dir
 ├── CMakeLists.txt
-├── BUILD.md                  # Build & install walkthrough
+├── SETUP.md                  # End-user install guide (screen-reader friendly)
+├── BUILD.md                  # Build-from-source walkthrough
 └── ARCHITECTURE.md           # How the pieces fit together
 ```
+
+## Installing as a player
+
+If you just want to use the mod and not compile it yourself, follow
+`SETUP.md`. It walks through installing UE4SS, copying the mod files
+into the game folder, and enabling it — no compiler or git required.
 
 ## Quick start
 
