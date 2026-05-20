@@ -6,8 +6,10 @@ Routes in-game text to NVDA (and other screen readers, with SAPI fallback) via
 features: stat hotkeys, point-of-interest navigation with audio beacon, target
 lock, and screen-reader-friendly handling of Palworld's native menus.
 
-> **Status: alpha 2 (v0.2.0-alpha.2).** First release with a prebuilt
-> binary — drag-and-drop install via the zip on the
+> **Status: alpha 3 (v0.3.0-alpha.3).** New speech rules (cued vs
+> interrupting), F6 nav menu category filter (Fast travel / Dungeons /
+> Landmarks / Buildings), patch notes auto-reader, and a pile of menu
+> cleanups. Drag-and-drop install via the zip on the
 > [latest release](https://github.com/nordanc/PalworldAccessibility/releases/latest)
 > + `SETUP.md`. Day-to-day play is reachable through the screen reader. Expect
 > rough edges on game UIs that haven't been mapped yet — bug reports / log
