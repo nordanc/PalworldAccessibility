@@ -10,6 +10,7 @@ add_library(${TARGET} SHARED
     Hooks.cpp
     Hotkeys.cpp
     Nav.cpp
+    PatchNotes.cpp
 )
 
 target_include_directories(${TARGET} PRIVATE .)

@@ -23,6 +23,7 @@ bool TolkBridge::Load() {
     m_pPreferSAPI = reinterpret_cast<FnPreferSAPI>  (GetProcAddress(mod, "Tolk_PreferSAPI"));
     m_pIsLoaded   = reinterpret_cast<FnIsLoaded>    (GetProcAddress(mod, "Tolk_IsLoaded"));
     m_pHasSpeech  = reinterpret_cast<FnHasSpeech>   (GetProcAddress(mod, "Tolk_HasSpeech"));
+    m_pIsSpeaking = reinterpret_cast<FnIsSpeaking>  (GetProcAddress(mod, "Tolk_IsSpeaking"));
     m_pDetect     = reinterpret_cast<FnDetectReader>(GetProcAddress(mod, "Tolk_DetectScreenReader"));
     m_pOutput     = reinterpret_cast<FnOutput>      (GetProcAddress(mod, "Tolk_Output"));
     m_pSpeak      = reinterpret_cast<FnSpeak>       (GetProcAddress(mod, "Tolk_Speak"));
@@ -53,6 +54,10 @@ void TolkBridge::Unload() {
 
 bool TolkBridge::HasSpeech() const {
     return m_loaded && m_pHasSpeech && m_pHasSpeech();
+}
+
+bool TolkBridge::IsSpeaking() const {
+    return m_loaded && m_pIsSpeaking && m_pIsSpeaking();
 }
 
 const wchar_t* TolkBridge::DetectScreenReader() const {

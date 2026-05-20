@@ -210,6 +210,89 @@ PoiHint ClassifyPOI(std::wstring_view cn) {
         cn.find(L"Tree") != std::wstring::npos) {
         return { L"Tree", L"Tree" };
     }
+    // Other natural resource spawners (rock, ore, coal, etc.) — name from
+    // class tail. "BP_PalMapObjectSpawner_RockCoal_C" -> "Rock coal".
+    if (cn.starts_with(L"BP_PalMapObjectSpawner_")) {
+        constexpr std::wstring_view pfx = L"BP_PalMapObjectSpawner_";
+        std::wstring tail(cn.substr(pfx.size()));
+        if (tail.ends_with(L"_C")) tail.resize(tail.size() - 2);
+        while (!tail.empty() && (std::iswdigit(tail.back()) || tail.back() == L'_')) {
+            tail.pop_back();
+        }
+        std::replace(tail.begin(), tail.end(), L'_', L' ');
+        if (tail.empty()) tail = L"Resource";
+        else tail[0] = std::towupper(tail[0]);
+        return { L"Resource", std::move(tail) };
+    }
+    // Player-built structures. Palworld classes are under
+    // /Game/Pal/Blueprint/MapObject/BuildObject/ with prefix
+    // BP_BuildObject_ — e.g. BP_BuildObject_WorkBench_SkillUnlock,
+    // BP_BuildObject_HeaterElectric, BP_BuildObject_PalBox, etc.
+    // Log every new class so the user can grep UE4SS.log for
+    // "building-shaped POI" if something we expect isn't appearing.
+    if (cn.starts_with(L"BP_BuildObject_")) {
+        static std::mutex                       s_b_mtx;
+        static std::unordered_set<std::wstring> s_b_seen;
+        {
+            std::lock_guard<std::mutex> lock(s_b_mtx);
+            if (s_b_seen.insert(std::wstring(cn)).second) {
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess] building-shaped POI: {}\n"), cn);
+            }
+        }
+        // Build a human-readable name from the class tail.
+        // "BP_BuildObject_WorkBench_SkillUnlock_C" -> "Work bench skill unlock"
+        std::wstring tail(cn);
+        if (tail.ends_with(L"_C")) tail.resize(tail.size() - 2);
+        constexpr std::wstring_view pfx = L"BP_BuildObject_";
+        if (tail.size() >= pfx.size() && tail.compare(0, pfx.size(), pfx.data()) == 0) {
+            tail.erase(0, pfx.size());
+        }
+        while (!tail.empty() && (std::iswdigit(tail.back()) || tail.back() == L'_')) {
+            tail.pop_back();
+        }
+        // Split CamelCase before underscore replacement so
+        // "WorkBench_SkillUnlock" becomes "Work Bench Skill Unlock".
+        std::wstring out;
+        out.reserve(tail.size() + 4);
+        for (size_t i = 0; i < tail.size(); ++i) {
+            wchar_t c = tail[i];
+            if (i > 0 && c >= L'A' && c <= L'Z') {
+                wchar_t prev = tail[i - 1];
+                bool prev_lower = prev >= L'a' && prev <= L'z';
+                bool prev_digit = prev >= L'0' && prev <= L'9';
+                if (prev_lower || prev_digit) out += L' ';
+            }
+            out += c;
+        }
+        std::replace(out.begin(), out.end(), L'_', L' ');
+        // Lowercase everything past the first character so the result
+        // reads like "Work bench skill unlock" rather than "Work Bench Skill Unlock".
+        if (out.empty()) out = L"Building";
+        else {
+            out[0] = std::towupper(out[0]);
+            for (size_t i = 1; i < out.size(); ++i) out[i] = std::towlower(out[i]);
+        }
+        return { L"Building", std::move(out) };
+    }
+    return {};
+}
+
+// Map the granular POI category produced by ClassifyPOI into the
+// user-facing top-level bucket the F6 nav menu groups by. Empty means
+// "skip this POI from the menu entirely."
+std::wstring NavMenuTopCategory(std::wstring_view granular) {
+    if (granular == L"Dungeon" ||
+        granular == L"Fixed dungeon" ||
+        granular == L"Arena" ||
+        granular == L"Tower") return L"Dungeons";
+    if (granular == L"Fast travel" ||
+        granular == L"Respawn")    return L"Fast travel";
+    if (granular == L"Building")   return L"Buildings";
+    if (granular == L"Tree" ||
+        granular == L"Resource" ||
+        granular == L"Fishing" ||
+        granular == L"Oilrig")     return L"Landmarks";
     return {};
 }
 
@@ -227,16 +310,24 @@ std::wstring FormatDistance(double cm) {
 // Menu / armed-target / target-lock state shared between hotkey handlers.
 struct NavState {
     std::mutex                       mtx;
-    bool                             menu_open = false;
-    std::vector<Nav::POI>            menu_list;
-    std::size_t                      selected_index = 0;
     std::optional<Nav::POI>          armed_target;
+
+    struct CategoryGroup { std::wstring name; std::vector<Nav::POI> items; };
+
+    // F6 nav menu (was a flat list; now grouped by top-level category).
+    // D-pad up/down cycles items in the current category; left/right
+    // cycles categories. menu_groups is sorted with non-empty categories
+    // only — empty buckets (e.g. "Buildings" if the player hasn't built
+    // anything yet) never appear.
+    bool                             menu_open = false;
+    std::vector<CategoryGroup>       menu_groups;
+    std::size_t                      menu_cat_index  = 0;
+    std::size_t                      menu_item_index = 0;
 
     // Target-lock (LB held): nearby things grouped by category. D-pad
     // left/right cycles category; up/down cycles within. On release, the
     // currently highlighted item is promoted to armed_target.
     bool                             target_mode = false;
-    struct CategoryGroup { std::wstring name; std::vector<Nav::POI> items; };
     std::vector<CategoryGroup>       target_groups;
     std::size_t                      cat_index    = 0;
     std::size_t                      item_index   = 0;
@@ -276,14 +367,25 @@ std::optional<std::array<double, 3>> GetPlayerLocation() {
     return GetPlayerPosOrError().pos;
 }
 
-// Announce the currently selected entry of the open menu.
-void AnnounceSelection() {
+// Speak the current item within the current category.
+// withCategory=true prepends the category name; used when the player
+// cycles categories so they hear which bucket they're in.
+void AnnounceMenuSelection(bool withCategory) {
     auto& s = g_state;
-    if (s.menu_list.empty()) return;
-    const auto& poi = s.menu_list[s.selected_index];
-    std::wstring msg = std::to_wstring(s.selected_index + 1);
+    if (s.menu_groups.empty()) return;
+    if (s.menu_cat_index >= s.menu_groups.size()) return;
+    const auto& group = s.menu_groups[s.menu_cat_index];
+    if (group.items.empty() || s.menu_item_index >= group.items.size()) return;
+    const auto& poi = group.items[s.menu_item_index];
+
+    std::wstring msg;
+    if (withCategory) {
+        msg += group.name;
+        msg += L". ";
+    }
+    msg += std::to_wstring(s.menu_item_index + 1);
     msg += L" of ";
-    msg += std::to_wstring(s.menu_list.size());
+    msg += std::to_wstring(group.items.size());
     msg += L". ";
     msg += poi.name;
     if (auto pp = GetPlayerLocation()) {
@@ -291,7 +393,7 @@ void AnnounceSelection() {
         msg += L", ";
         msg += FormatDistance(d);
     }
-    Speech::Get().FocusUpdate(std::wstring_view(msg));
+    Speech::Get().SpeakNow(std::wstring_view(msg));
 }
 
 } // namespace
@@ -405,68 +507,133 @@ void Nav::ToggleMenu() {
     std::lock_guard<std::mutex> lock(g_state.mtx);
     if (g_state.menu_open) {
         g_state.menu_open = false;
-        Speech::Get().Announce(L"Navigation menu closed.");
+        g_state.menu_groups.clear();
+        Speech::Get().SpeakNow(L"Navigation menu closed.");
         return;
     }
     auto pr = GetPlayerPosOrError();
     if (!pr.pos) {
-        Speech::Get().Announce(pr.error);
+        Speech::Get().SpeakNow(pr.error);
         return;
     }
     auto& pp = pr.pos;
     auto pois = ScanPOIs();
     if (pois.empty()) {
-        Speech::Get().Announce(L"No points of interest found.");
+        Speech::Get().SpeakNow(L"No points of interest found.");
         return;
     }
-    std::sort(pois.begin(), pois.end(), [&](const POI& a, const POI& b) {
-        return DistanceCm(a, (*pp)[0], (*pp)[1], (*pp)[2]) <
-               DistanceCm(b, (*pp)[0], (*pp)[1], (*pp)[2]);
-    });
-    // Cap to the 50 closest so the user doesn't have to cycle past every
-    // tree on the map. Tweak this if it feels too short or too long.
-    constexpr std::size_t kMaxEntries = 50;
-    if (pois.size() > kMaxEntries) pois.resize(kMaxEntries);
-    g_state.menu_list = std::move(pois);
-    g_state.selected_index = 0;
-    g_state.menu_open = true;
-    Speech::Get().Announce(
-        L"Navigation menu open. Arrow keys to navigate, Enter to select, escape or F6 to close.");
-    AnnounceSelection();
+
+    // Bucket each POI into its top-level nav category. POIs whose
+    // granular category doesn't map are dropped from the menu.
+    std::unordered_map<std::wstring, std::vector<POI>> buckets;
+    for (auto& poi : pois) {
+        auto top = NavMenuTopCategory(poi.category);
+        if (top.empty()) continue;
+        buckets[std::wstring(top)].push_back(std::move(poi));
+    }
+
+    if (buckets.empty()) {
+        Speech::Get().SpeakNow(L"No points of interest found.");
+        return;
+    }
+
+    // Stable category order (closest-to-player buckets first feels
+    // unhelpful; alphabetical or hand-picked feels predictable). Fixed
+    // order: Fast travel, Dungeons, Landmarks, Buildings.
+    static const std::wstring kOrder[] = {
+        L"Fast travel", L"Dungeons", L"Landmarks", L"Buildings",
+    };
+    std::vector<NavState::CategoryGroup> groups;
+    for (const auto& cat : kOrder) {
+        auto it = buckets.find(cat);
+        if (it == buckets.end() || it->second.empty()) continue;
+        // Sort within the bucket by distance and cap to keep navigation
+        // tractable (50 buildings is fine; 500 trees is not).
+        std::sort(it->second.begin(), it->second.end(), [&](const POI& a, const POI& b){
+            return DistanceCm(a, (*pp)[0], (*pp)[1], (*pp)[2]) <
+                   DistanceCm(b, (*pp)[0], (*pp)[1], (*pp)[2]);
+        });
+        constexpr std::size_t kMaxPerCategory = 50;
+        if (it->second.size() > kMaxPerCategory) it->second.resize(kMaxPerCategory);
+        NavState::CategoryGroup g;
+        g.name  = cat;
+        g.items = std::move(it->second);
+        groups.push_back(std::move(g));
+    }
+
+    if (groups.empty()) {
+        Speech::Get().SpeakNow(L"No points of interest found.");
+        return;
+    }
+
+    g_state.menu_groups     = std::move(groups);
+    g_state.menu_cat_index  = 0;
+    g_state.menu_item_index = 0;
+    g_state.menu_open       = true;
+    Speech::Get().SpeakNow(
+        L"Navigation menu open. Up and down to move, left and right to switch category, "
+        L"Enter to select, escape or F6 to close.");
+    AnnounceMenuSelection(/*withCategory=*/true);
 }
 
 void Nav::MenuNext() {
     std::lock_guard<std::mutex> lock(g_state.mtx);
-    if (!g_state.menu_open || g_state.menu_list.empty()) return;
-    g_state.selected_index =
-        (g_state.selected_index + 1) % g_state.menu_list.size();
-    AnnounceSelection();
+    if (!g_state.menu_open || g_state.menu_groups.empty()) return;
+    auto& g = g_state.menu_groups[g_state.menu_cat_index];
+    if (g.items.empty()) return;
+    g_state.menu_item_index = (g_state.menu_item_index + 1) % g.items.size();
+    AnnounceMenuSelection(/*withCategory=*/false);
 }
 
 void Nav::MenuPrev() {
     std::lock_guard<std::mutex> lock(g_state.mtx);
-    if (!g_state.menu_open || g_state.menu_list.empty()) return;
-    g_state.selected_index =
-        (g_state.selected_index + g_state.menu_list.size() - 1) % g_state.menu_list.size();
-    AnnounceSelection();
+    if (!g_state.menu_open || g_state.menu_groups.empty()) return;
+    auto& g = g_state.menu_groups[g_state.menu_cat_index];
+    if (g.items.empty()) return;
+    g_state.menu_item_index =
+        (g_state.menu_item_index + g.items.size() - 1) % g.items.size();
+    AnnounceMenuSelection(/*withCategory=*/false);
+}
+
+void Nav::MenuCategoryNext() {
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    if (!g_state.menu_open || g_state.menu_groups.empty()) return;
+    g_state.menu_cat_index =
+        (g_state.menu_cat_index + 1) % g_state.menu_groups.size();
+    g_state.menu_item_index = 0;
+    AnnounceMenuSelection(/*withCategory=*/true);
+}
+
+void Nav::MenuCategoryPrev() {
+    std::lock_guard<std::mutex> lock(g_state.mtx);
+    if (!g_state.menu_open || g_state.menu_groups.empty()) return;
+    g_state.menu_cat_index =
+        (g_state.menu_cat_index + g_state.menu_groups.size() - 1)
+        % g_state.menu_groups.size();
+    g_state.menu_item_index = 0;
+    AnnounceMenuSelection(/*withCategory=*/true);
 }
 
 void Nav::MenuConfirm() {
     std::lock_guard<std::mutex> lock(g_state.mtx);
-    if (!g_state.menu_open || g_state.menu_list.empty()) return;
-    g_state.armed_target = g_state.menu_list[g_state.selected_index];
-    g_state.menu_open = false;
+    if (!g_state.menu_open || g_state.menu_groups.empty()) return;
+    auto& g = g_state.menu_groups[g_state.menu_cat_index];
+    if (g.items.empty()) return;
+    g_state.armed_target = g.items[g_state.menu_item_index];
+    g_state.menu_open    = false;
+    g_state.menu_groups.clear();
     std::wstring msg = L"Tracking ";
     msg += g_state.armed_target->name;
     msg += L".";
-    Speech::Get().Announce(std::wstring_view(msg));
+    Speech::Get().SpeakNow(std::wstring_view(msg));
 }
 
 void Nav::MenuClose() {
     std::lock_guard<std::mutex> lock(g_state.mtx);
     if (!g_state.menu_open) return;
     g_state.menu_open = false;
-    Speech::Get().Announce(L"Navigation menu closed.");
+    g_state.menu_groups.clear();
+    Speech::Get().SpeakNow(L"Navigation menu closed.");
 }
 
 void Nav::CancelArmedTarget() {
@@ -817,7 +984,7 @@ void AnnounceTargetSelection() {
         msg += L", ";
         msg += FormatDistance(d);
     }
-    Speech::Get().FocusUpdate(std::wstring_view(msg));
+    Speech::Get().SpeakNow(std::wstring_view(msg));
 }
 
 } // namespace
@@ -825,12 +992,12 @@ void AnnounceTargetSelection() {
 void Nav::EnterTargetMode() {
     auto pp = GetPlayerLocation();
     if (!pp) {
-        Speech::Get().Announce(L"Cannot target, player not loaded.");
+        Speech::Get().SpeakNow(L"Cannot target, player not loaded.");
         return;
     }
     auto groups = ScanTargetGroups((*pp)[0], (*pp)[1], (*pp)[2]);
     if (groups.empty()) {
-        Speech::Get().Announce(L"Nothing nearby to target.");
+        Speech::Get().SpeakNow(L"Nothing nearby to target.");
         return;
     }
     // Cap each category so we don't end up cycling 200 trees.
@@ -870,7 +1037,7 @@ void Nav::ExitTargetMode() {
         std::wstring msg = L"Targeting ";
         msg += armed.name;
         msg += L".";
-        Speech::Get().Announce(std::wstring_view(msg));
+        Speech::Get().SpeakNow(std::wstring_view(msg));
         // Reset the guidance state so the first tick announces direction
         // and pings the beacon immediately.
         g_last_direction.clear();

@@ -441,7 +441,9 @@ void SpeakStatBy(std::wstring_view label,
     auto* p = GetPlayer();
     auto* s = GetPlayerState();
     if (!p && !s) {
-        Speech::Get().Announce(L"Player not loaded.");
+        // SpeakNow so rapid F1/F2/F3/F4 presses interrupt each other and
+        // never get swallowed by a stale menu cascade gate.
+        Speech::Get().SpeakNow(L"Player not loaded.");
         return;
     }
     std::optional<double> cur, max;
@@ -452,7 +454,7 @@ void SpeakStatBy(std::wstring_view label,
         if (cur && (max_fields.size() == 0 || (max && *max > 0))) break;
     }
     if (!cur) {
-        Speech::Get().Announce(not_found_msg);
+        Speech::Get().SpeakNow(not_found_msg);
         return;
     }
     std::wstring msg(label);
@@ -462,7 +464,7 @@ void SpeakStatBy(std::wstring_view label,
         msg += L" out of ";
         msg += FormatNumber(*max);
     }
-    Speech::Get().Announce(std::wstring_view(msg));
+    Speech::Get().SpeakNow(std::wstring_view(msg));
 }
 
 // Dump inner properties of a script struct, recursing one level into
@@ -672,24 +674,42 @@ void Hotkeys::Tick() {
                               { L"Level" }, {},
                               L"Level not found."); } },
         { VK_F5,  false, []{ Nav::ListNearby(); } },
+        // Silence the current reading queue — primarily for the patch
+        // notes reader, but works for any in-progress speech.
+        { VK_F8,  false, []{ Speech::Get().Silence(); } },
         { VK_F11, false, []{
-            // Controller diagnostic. DualSense / DualShock need Steam Input
-            // (or DS4Windows) to appear as XInput. If no slot reports
-            // connected, the user must enable Steam Input for Palworld.
-            int count = 0;
+            // Controller + target-lock diagnostic. Reports:
+            //   - X Input slots connected
+            //   - whether LB is currently pressed (XInput-level)
+            //   - whether IsInGameMenuOpen() is gating target lock
+            //   - whether target mode is currently active
+            int count = 0, lb_count = 0;
             for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
                 XINPUT_STATE xs{};
-                if (XInputGetState(i, &xs) == ERROR_SUCCESS) ++count;
+                if (XInputGetState(i, &xs) != ERROR_SUCCESS) continue;
+                ++count;
+                if (xs.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ++lb_count;
             }
+            const bool menu_open    = Nav::IsInGameMenuOpen();
+            const bool target_mode  = Nav::IsTargetModeActive();
             if (count == 0) {
-                Speech::Get().Announce(
+                Speech::Get().SpeakNow(
                     L"No X Input controller detected. In Steam, right-click Palworld, "
                     L"Properties, Controller, enable Steam Input.");
             } else {
-                std::wstring msg = L"X Input controllers connected: ";
+                std::wstring msg = L"X Input controllers ";
                 msg += std::to_wstring(count);
-                Speech::Get().Announce(std::wstring_view(msg));
+                msg += L", L B held ";
+                msg += (lb_count ? L"yes" : L"no");
+                msg += L", in game menu open ";
+                msg += (menu_open ? L"yes" : L"no");
+                msg += L", target mode ";
+                msg += (target_mode ? L"yes" : L"no");
+                Speech::Get().SpeakNow(std::wstring_view(msg));
             }
+            Output::send<LogLevel::Default>(
+                STR("[PalAccess] F11 diag: xinput={} lb={} menu_open={} target_mode={}\n"),
+                count, lb_count, menu_open, target_mode);
         }},
         { VK_F6,  false, []{ Nav::ToggleMenu(); } },
         { VK_F9,  false, []{ Nav::CancelArmedTarget(); } },
@@ -706,9 +726,11 @@ void Hotkeys::Tick() {
         }},
         { VK_LEFT,   false, []{
             if (Nav::IsTargetModeActive()) Nav::TargetCategoryPrev();
+            else if (Nav::IsMenuOpen())    Nav::MenuCategoryPrev();
         }},
         { VK_RIGHT,  false, []{
             if (Nav::IsTargetModeActive()) Nav::TargetCategoryNext();
+            else if (Nav::IsMenuOpen())    Nav::MenuCategoryNext();
         }},
         { VK_RETURN, false, []{ if (Nav::IsMenuOpen()) Nav::MenuConfirm(); } },
         { VK_ESCAPE, false, []{ if (Nav::IsMenuOpen()) Nav::MenuClose(); } },
@@ -752,10 +774,13 @@ void Hotkeys::Tick() {
     static bool prev_lb_or_tab = false;
     bool tab_held = (::GetAsyncKeyState(kVkTabKey) & 0x8000) != 0;
     bool lb_or_tab = gp.lb || tab_held;
-    // Suppress target-lock entirely while an in-game menu (construction,
-    // inventory, settings, etc.) is open — those menus typically use LB/RB
-    // as tab-switch shortcuts and we don't want to fight them.
-    if (Nav::IsInGameMenuOpen()) lb_or_tab = false;
+    // Previously we suppressed target-lock while Nav::IsInGameMenuOpen()
+    // returned true, on the theory that menus use LB/RB for tab-switching.
+    // But that check returned true forever once any menu widget was
+    // instantiated (they linger in the UObject array even after closing),
+    // which blocked target-lock in the open world. Removed for now; if
+    // target-lock starts firing during pause-menu navigation we'll add a
+    // visibility-based check.
     if (lb_or_tab && !prev_lb_or_tab)        Nav::EnterTargetMode();
     else if (!lb_or_tab && prev_lb_or_tab)   Nav::ExitTargetMode();
     prev_lb_or_tab = lb_or_tab;
@@ -769,11 +794,13 @@ void Hotkeys::Tick() {
         if (Nav::IsTargetModeActive())  Nav::TargetNext();
         else if (Nav::IsMenuOpen())     Nav::MenuNext();
     }
-    if (gp.dleft && !prev_gp.dleft && Nav::IsTargetModeActive()) {
-        Nav::TargetCategoryPrev();
+    if (gp.dleft && !prev_gp.dleft) {
+        if (Nav::IsTargetModeActive()) Nav::TargetCategoryPrev();
+        else if (Nav::IsMenuOpen())    Nav::MenuCategoryPrev();
     }
-    if (gp.dright && !prev_gp.dright && Nav::IsTargetModeActive()) {
-        Nav::TargetCategoryNext();
+    if (gp.dright && !prev_gp.dright) {
+        if (Nav::IsTargetModeActive()) Nav::TargetCategoryNext();
+        else if (Nav::IsMenuOpen())    Nav::MenuCategoryNext();
     }
     if (gp.a && !prev_gp.a && Nav::IsMenuOpen()) Nav::MenuConfirm();
     if (gp.b && !prev_gp.b && Nav::IsMenuOpen()) Nav::MenuClose();

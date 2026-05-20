@@ -44,6 +44,8 @@ public:
     static void ToggleMenu();
     static void MenuNext();
     static void MenuPrev();
+    static void MenuCategoryNext();  // d-pad right / arrow right
+    static void MenuCategoryPrev();  // d-pad left  / arrow left
     static void MenuConfirm();
     static void MenuClose();
     static void CancelArmedTarget();

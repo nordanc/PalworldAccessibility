@@ -14,6 +14,7 @@ public:
 
     bool IsLoaded() const { return m_loaded; }
     bool HasSpeech() const;
+    bool IsSpeaking() const;
     const wchar_t* DetectScreenReader() const;
 
     bool Output(const wchar_t* text, bool interrupt);
@@ -32,6 +33,7 @@ private:
     using FnPreferSAPI     = void (__cdecl*)(bool);
     using FnIsLoaded       = bool (__cdecl*)();
     using FnHasSpeech      = bool (__cdecl*)();
+    using FnIsSpeaking     = bool (__cdecl*)();
     using FnDetectReader   = const wchar_t* (__cdecl*)();
     using FnOutput         = bool (__cdecl*)(const wchar_t*, bool);
     using FnSpeak          = bool (__cdecl*)(const wchar_t*, bool);
@@ -45,6 +47,7 @@ private:
     FnPreferSAPI    m_pPreferSAPI   = nullptr;
     FnIsLoaded      m_pIsLoaded     = nullptr;
     FnHasSpeech     m_pHasSpeech    = nullptr;
+    FnIsSpeaking    m_pIsSpeaking   = nullptr;
     FnDetectReader  m_pDetect       = nullptr;
     FnOutput        m_pOutput       = nullptr;
     FnSpeak         m_pSpeak        = nullptr;

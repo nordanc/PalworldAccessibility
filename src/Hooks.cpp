@@ -1,6 +1,7 @@
 #include "Hooks.hpp"
 #include "Speech.hpp"
 #include "Hotkeys.hpp"
+#include "PatchNotes.hpp"
 
 #include <DynamicOutput/Output.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -10,6 +11,7 @@
 #include <Unreal/UClass.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -19,6 +21,34 @@
 using namespace RC;
 
 namespace PalAccess {
+
+// File-scope state for the patch-notes WebBrowser URL poll. Populated
+// when WBP_WebBrowser_News_C constructs; cleared once we log the URL
+// or the cached pointer dies.
+static std::mutex                                   g_news_mtx;
+static Unreal::UObject*                             g_news_inner = nullptr;
+static bool                                         g_news_url_logged = false;
+static std::chrono::steady_clock::time_point        g_news_construct_at{};
+
+// File-scope state for the quest start/clear popup poll. Populated when
+// WBP_InGame_Quest_StartClear_C constructs; cleared once we successfully
+// announce the resolved quest title or the cached pointer dies.
+//
+// Why polling: Palworld constructs the popup with placeholder text
+// ("クエスト名") then the widget's ubergraph resolves the title from its
+// quest DataTable. The text-block SetText path doesn't reliably fire
+// through the blueprint UFunction hook (it's set via FText binding or
+// native code). Reading the live FText value off the text-block
+// property each tick is the most robust path.
+static std::mutex                                   g_quest_mtx;
+static Unreal::UObject*                             g_quest_popup = nullptr;
+static std::chrono::steady_clock::time_point        g_quest_construct_at{};
+static bool                                         g_quest_announced = false;
+// Set by HandleQuestNotification when the questboard tracker updates —
+// used as a fallback source for the resolved title when the popup keeps
+// rendering the クエスト名 placeholder.
+static std::wstring                                 g_questboard_labels;
+static std::chrono::steady_clock::time_point        g_questboard_at{};
 
 namespace {
 
@@ -254,14 +284,17 @@ struct FriendlyEntry {
     std::wstring_view spoken;
 };
 constexpr FriendlyEntry kFriendly[] = {
-    { L"WBP_Title_MenuButton_C",        L"Title menu button"   },
     { L"WBP_Title_SettingsButton_C",    L"Settings"            },
     { L"WBP_Title_WorldSelectButton_C", L"World select button" },
     { L"WBP_Title_WorldMenu_Head_C",    L"World menu"          },
     { L"WBP_Title_WorldSelect_C",       L"World select panel"  },
     { L"WBP_TitleVerText_C",            L"Version info"        },
-    { L"WBP_TItle_C",                   L"Title screen"        },
-    { L"WBP_TitleMenu_C",               L"Title menu"          },
+    // WBP_Title_MenuButton_C, WBP_TItle_C, and WBP_TitleMenu_C
+    // removed: their friendly names ("Title menu button", "Title
+    // screen", "Title menu") leak out as hover fallbacks before the
+    // patch-notes screen settles, drowning out the patch notes.
+    // Specific instance-tagged buttons (StartLocalGame, etc.) still
+    // speak via FindOutermostTaggedButton.
     { L"WBP_JoinGame_C",                L"Join game panel"     },
     { L"WBP_PalDialog_C",               L"Dialog"              },
     { L"WBP_CommonPopupWindow_C",       L"Pop-up"              },
@@ -783,23 +816,37 @@ void HandleButtonHover(Unreal::UObject* Context, Unreal::FFrame& Stack) {
 
 // A major UI panel was constructed — announce the screen change.
 void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    // Patch-notes Destruct: cancel any in-flight fetch + silence ongoing
+    // reading. Done before the Construct/OnSetup gate so Destruct events
+    // reach this branch.
+    if (FunctionNameIs(Stack, L"Destruct")) {
+        auto cls = Context->GetClassPrivate();
+        if (cls && cls->GetName() == L"WBP_WebBrowser_News_C") {
+            PatchNotes::Cancel();
+        }
+        return;
+    }
     if (!FunctionNameIs(Stack, L"Construct") &&
         !FunctionNameIs(Stack, L"OnSetup")) {
         return;
     }
     struct Entry { std::wstring_view klass; std::wstring_view spoken; };
     static const Entry kPanels[] = {
-        // Confirmed in earlier logs
-        { L"WBP_TItle_C",                       L"Title screen"            },
-        { L"WBP_TitleMenu_C",                   L"Title menu"              },
+        // Title screen (WBP_TItle_C), title menu container
+        // (WBP_TitleMenu_C), and loading screen (WBP_LoadingScreen_C)
+        // intentionally omitted: they construct during game launch and
+        // would either compete with the patch-notes announce in the
+        // cluster window or speak after dismissal as redundant noise.
+        // The first focused menu button announces itself on focus.
         { L"WBP_Title_WorldSelect_C",           L"World select"            },
         { L"WBP_JoinGame_C",                    L"Join game"               },
         { L"WBP_PalDialog_C",                   L"Dialog"                  },
         { L"WBP_CommonPopupWindow_C",           L"Pop-up window"           },
-        { L"WBP_LoadingScreen_C",               L"Loading"                 },
-        // Confirmed Settings hierarchy
-        { L"WBP_OptionSettings_C",              L"Settings"                },
-        { L"WBP_OptionSettings_ListContent_C",  L"Settings content"        },
+        // Confirmed Settings hierarchy. The container panels
+        // (WBP_OptionSettings_C / WBP_OptionSettings_ListContent_C)
+        // intentionally omitted — they construct alongside all five
+        // tab panels in a cluster, and the user really wants to hear
+        // the active tab ("Graphics settings"), not the parent.
         { L"WBP_Graphic_Settings_C",            L"Graphics settings"       },
         { L"WBP_Sound_Settings_C",              L"Audio settings"          },
         { L"WBP_Control_Settings_C",            L"Controls settings"       },
@@ -825,6 +872,14 @@ void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
         { L"WBP_Placement_C",                   L"Placement menu"          },
         { L"WBP_PlacementMenu_C",               L"Placement menu"          },
         { L"WBP_QuickAccess_Build_C",           L"Build quick menu"        },
+        // Confirmed via UE4SS.log discovery: Palworld renders the
+        // pre-title patch notes inside an embedded Chromium browser
+        // (WBP_WebBrowser_News_C). The actual text is HTML rendered by
+        // CEF, not exposed as UMG properties — we can only announce
+        // that it's there and tell the player how to dismiss it.
+        { L"WBP_WebBrowser_News_C",
+          L"Patch notes. Press escape or B to close and continue to main menu." },
+
         // Still-guessing entries for single-player / multiplayer flows
         { L"WBP_NewWorld_C",                    L"Create new world"        },
         { L"WBP_CreateWorld_C",                 L"Create new world"        },
@@ -843,6 +898,12 @@ void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
         { L"WBP_Title_InviteCode_C",            L"Invite code"             },
         { L"WBP_InviteCode_C",                  L"Invite code"             },
         { L"WBP_Title_HostServer_C",            L"Host server"             },
+
+        // Quest / mission list panel inside the in-game pause menu.
+        // WBP_QuestTab_C is the actual tab wrapper; its sub-widgets
+        // (WBP_Quest_List_C / WBP_Quest_ForDisplay_C) are excluded from
+        // the quest-menu catch-all below so we only announce once.
+        { L"WBP_QuestTab_C",                    L"Mission list"            },
     };
     auto cls = Context->GetClassPrivate();
     if (!cls) return;
@@ -851,9 +912,182 @@ void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
     // displayed cur/max text even when SaveParameter's max is unpopulated.
     Hotkeys::NoticePotentialGaugeWidget(Context);
 
+    // Cache the inner WebBrowserWidget for the patch-notes panel. Tick()
+    // will poll GetUrl() on it until the URL becomes available, so we
+    // can see where Palworld is fetching the notes from.
+    if (FunctionNameIs(Stack, L"Construct") && name == L"WBP_WebBrowser_News_C") {
+        for (auto* prop : cls->ForEachPropertyInChain()) {
+            if (!prop) continue;
+            if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+            if (prop->GetName() != L"WebBrowserWidget") continue;
+            auto** child_ptr = prop->ContainerPtrToValuePtr<Unreal::UObject*>(Context);
+            if (child_ptr && *child_ptr) {
+                std::lock_guard<std::mutex> lock(g_news_mtx);
+                g_news_inner   = *child_ptr;
+                g_news_url_logged = false;
+                g_news_construct_at = std::chrono::steady_clock::now();
+            }
+            break;
+        }
+    }
+
+    // One-shot dump of the inner WebBrowserWidget that hosts the
+    // patch-notes HTML — we want to find an InitialURL / Url string
+    // we could fetch out-of-band and read out.
+    if (FunctionNameIs(Stack, L"Construct") && name == L"WBP_WebBrowser_News_C") {
+        static std::once_flag s_news_dumped;
+        std::call_once(s_news_dumped, [&]{
+            // Find the WebBrowserWidget ObjectProperty on the panel and
+            // dump the inner widget's UClass properties.
+            for (auto* prop : cls->ForEachPropertyInChain()) {
+                if (!prop) continue;
+                if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+                if (prop->GetName() != L"WebBrowserWidget") continue;
+                auto** child_ptr = prop->ContainerPtrToValuePtr<Unreal::UObject*>(Context);
+                if (!child_ptr || !*child_ptr) {
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess] WebBrowserWidget pointer is null\n"));
+                    return;
+                }
+                Unreal::UObject* inner = *child_ptr;
+                auto* inner_cls = inner->GetClassPrivate();
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess] === WebBrowserWidget {} properties ===\n"),
+                    inner_cls ? inner_cls->GetName() : L"<null cls>");
+                if (!inner_cls) return;
+                int n = 0;
+                for (auto* p2 : inner_cls->ForEachPropertyInChain()) {
+                    if (!p2) continue;
+                    if (++n > 200) break;
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess]   {} {}\n"),
+                        p2->GetClass().GetName(), p2->GetName());
+                    // For StrProperty fields, dump their current value too —
+                    // that's where InitialURL would live.
+                    if (p2->GetClass().GetName() == L"StrProperty") {
+                        auto* str_ptr = p2->ContainerPtrToValuePtr<Unreal::FString>(inner);
+                        if (str_ptr) {
+                            const wchar_t* data = str_ptr->GetCharArray().GetData();
+                            Output::send<LogLevel::Default>(
+                                STR("[PalAccess]     -> \"{}\"\n"),
+                                data ? data : L"");
+                        }
+                    }
+                }
+                return;
+            }
+            Output::send<LogLevel::Default>(
+                STR("[PalAccess] WebBrowserWidget property not found on news panel\n"));
+        });
+    }
+
     for (const auto& e : kPanels) {
         if (name == e.klass) {
+            // Two debounces:
+            //   - Per-class (600 ms): Construct + OnSetup both pass our
+            //     trigger filter, so the same panel fires twice. Drop
+            //     the second.
+            //   - Global cluster (500 ms): when entering Settings,
+            //     Palworld constructs all five tab panels at once
+            //     ("Graphics", "Audio", "Controls", "Key bindings",
+            //     "Other") even though only one is visible. We want
+            //     the user to hear the active tab — which is whichever
+            //     one happens to fire first — and silence the rest.
+            //     A real later tab-switch waits >500 ms, so it speaks.
+            static std::mutex                                                                 s_arrival_mtx;
+            static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point>     s_arrival_at;
+            static std::chrono::steady_clock::time_point                                       s_last_arrival_at{};
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(s_arrival_mtx);
+                auto it = s_arrival_at.find(name);
+                if (it != s_arrival_at.end()) {
+                    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - it->second).count();
+                    if (since < 600) return;
+                }
+                if (s_last_arrival_at.time_since_epoch().count() != 0) {
+                    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - s_last_arrival_at).count();
+                    if (since < 500) {
+                        s_arrival_at[name] = now;
+                        return;
+                    }
+                }
+                s_arrival_at[name] = now;
+                s_last_arrival_at = now;
+            }
+            Speech::Get().NotifyScreenArrival();
             Speech::Get().Announce(std::wstring_view(e.spoken));
+            return;
+        }
+    }
+
+    // Quest-list / quest-menu catch-all: when the player opens the
+    // pause-menu quest tab, the panel that holds the list of active
+    // missions constructs. We don't know its exact class name yet —
+    // catch anything WBP_* that has "Quest" in the name and isn't a
+    // child UI element we already handle (board / tracker / icon /
+    // popup), log it, and announce "Quest list" so the player knows
+    // they reached the screen.
+    if (FunctionNameIs(Stack, L"Construct") &&
+        (name.starts_with(L"WBP_") || name.starts_with(L"W_"))) {
+        const bool looks_quest_menu =
+            name.find(L"Quest") != std::wstring::npos &&
+            !name.ends_with(L"Button_C") &&
+            !name.ends_with(L"Icon_C") &&
+            !name.ends_with(L"_btn_C") &&
+            !name.ends_with(L"Slot_C") &&
+            !name.ends_with(L"Cursor_C") &&
+            !name.ends_with(L"Item_C") &&
+            // Already handled / not the list menu:
+            name != L"WBP_InGame_Quest_StartClear_C"        &&
+            name != L"WBP_Ingame_QuestBoard_C"              &&
+            name != L"WBP_QuestAndBaseCampInfoCanvas_C"     &&
+            name != L"WBP_QuestTrackingIconCanvas_C"        &&
+            name != L"WBP_PalQuestTrackingIcon_C"           &&
+            name != L"WBP_IngameCompass_Quest_C"            &&
+            name != L"WBP_NPC_OverheadQuest_C"              &&
+            // Quest-tab sub-widgets — kPanels handles WBP_QuestTab_C
+            // as the announce target; these are children that would
+            // otherwise re-announce "Quest list" with placeholder text
+            // (9999m before distance resolution, etc.).
+            name != L"WBP_QuestTab_C"                       &&
+            name != L"WBP_Quest_List_C"                     &&
+            name != L"WBP_Quest_ForDisplay_C"               &&
+            name.find(L"OverheadQuest") == std::wstring::npos &&
+            name.find(L"TrackingIcon") == std::wstring::npos &&
+            name.find(L"Compass")      == std::wstring::npos;
+        if (looks_quest_menu) {
+            static std::mutex                                                              s_q_mtx;
+            static std::unordered_set<std::wstring>                                        s_q_seen;
+            static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> s_q_at_class;
+            static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> s_q_at_spoken;
+            const auto now = std::chrono::steady_clock::now();
+            const std::wstring spoken = L"Quest list";
+            {
+                std::lock_guard<std::mutex> lock(s_q_mtx);
+                if (s_q_seen.insert(name).second) {
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess] quest-menu construct: {}\n"), name);
+                }
+                auto it = s_q_at_class.find(name);
+                if (it != s_q_at_class.end()) {
+                    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - it->second).count();
+                    if (since < 600) return;
+                }
+                s_q_at_class[name] = now;
+                auto sit = s_q_at_spoken.find(spoken);
+                if (sit != s_q_at_spoken.end()) {
+                    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - sit->second).count();
+                    if (since < 500) return;
+                }
+                s_q_at_spoken[spoken] = now;
+            }
+            Speech::Get().NotifyScreenArrival();
+            Speech::Get().Announce(std::wstring_view(spoken));
             return;
         }
     }
@@ -875,16 +1109,44 @@ void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
              name.find(L"Placement")    != std::wstring::npos) &&
             (name.starts_with(L"WBP_") || name.starts_with(L"W_"));
         if (looks_build) {
-            std::lock_guard<std::mutex> lock(s_b_mtx);
-            if (s_b_seen.insert(name).second) {
-                Output::send<LogLevel::Default>(
-                    STR("[PalAccess] build-shaped construct: {}\n"), name);
-            }
-            // Announce category each time the widget reappears so the user
-            // knows they're in the build flow.
             std::wstring spoken = L"Build menu";
             if (name.find(L"Placement") != std::wstring::npos) spoken = L"Placement menu";
             else if (name.find(L"Construction") != std::wstring::npos) spoken = L"Construction menu";
+            // Same per-class + global cluster debounce as the kPanels
+            // loop. Without it, opening the construction menu fires
+            // Construct on several "Construction*" sub-widgets and the
+            // user hears "Construction menu" repeated.
+            static std::mutex                                                              s_b_mtx;
+            static std::unordered_set<std::wstring>                                        s_b_seen;
+            static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> s_b_at_class;
+            static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> s_b_at_spoken;
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(s_b_mtx);
+                if (s_b_seen.insert(name).second) {
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess] build-shaped construct: {}\n"), name);
+                }
+                // Per-class: Construct + OnSetup pair on same widget.
+                auto it = s_b_at_class.find(name);
+                if (it != s_b_at_class.end()) {
+                    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - it->second).count();
+                    if (since < 600) return;
+                }
+                s_b_at_class[name] = now;
+                // Cluster on spoken text: any earlier announce of the
+                // SAME phrase within 500 ms (different sub-widgets of
+                // the construction menu) gets suppressed.
+                auto sit = s_b_at_spoken.find(spoken);
+                if (sit != s_b_at_spoken.end()) {
+                    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - sit->second).count();
+                    if (since < 500) return;
+                }
+                s_b_at_spoken[spoken] = now;
+            }
+            Speech::Get().NotifyScreenArrival();
             Speech::Get().Announce(std::wstring_view(spoken));
             return;
         }
@@ -893,6 +1155,8 @@ void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
     // Discovery aid: log the FIRST construct call for any class that LOOKS
     // panel-shaped (top-level WBP_*) so we can map new screens as they appear.
     // Limit to classes that don't look like a sub-widget (no nested suffixes).
+    // Logged at Default level so the user can grep UE4SS.log to find the
+    // class name of a new screen without enabling verbose logging.
     if (FunctionNameIs(Stack, L"Construct") &&
         (name.starts_with(L"WBP_") || name.starts_with(L"W_")) &&
         !name.ends_with(L"Button_C") &&
@@ -905,44 +1169,37 @@ void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
         std::lock_guard<std::mutex> lock(s_mtx);
         if (s_count < 200 && s_seen.insert(name).second) {
             ++s_count;
-            Output::send<LogLevel::Verbose>(
+            Output::send<LogLevel::Default>(
                 STR("[PalAccess] panel Construct: {}\n"), name);
         }
     }
 }
 
-// A click happened — give the user feedback. Strategy:
-//  1) Cached SetText label (popup buttons) → "Selected <label>"
-//  2) Tagged-button label (title-menu / settings categories) → "Selected <label>"
-//  3) Settings-row click (changes a value): re-read the row via reflection so
-//     the user hears the new state ("Mouse Sensitivity, 2"). No "Selected"
-//     prefix — the announcement is the new value itself.
-//  4) Fallback to humanized outer-widget class name.
+// A click happened. Strategy:
+//  1) Cached SetText label (popup buttons) — silent. The next screen or
+//     row update gives the real feedback.
+//  2) Tagged-button label (title-menu / settings categories) — silent.
+//     Same reasoning.
+//  3) Settings-row click (changes a value): re-read the row via
+//     reflection so the user hears the new state ("Mouse Sensitivity,
+//     2"). FocusUpdate interrupts cleanly and plays the new value
+//     tightly after the prior speech.
+//  4) Unknown button — silent. "Selected button" is noise; if a click
+//     produces no audible result we add a specific handler.
 void HandleButtonClick(Unreal::UObject* Context, Unreal::FFrame& Stack) {
     if (!FunctionNameIs(Stack, L"BP_OnClicked")) return;
 
-    // 1) Cached label.
+    // 1) Cached label — consume silently.
     if (auto cached = ButtonTextCache::Get().Lookup(Context); !cached.empty()) {
-        std::wstring msg = L"Selected ";
-        msg += cached;
-        Speech::Get().Announce(std::wstring_view(msg));
         return;
     }
 
-    // 2) Tagged button.
+    // 2) Tagged button — consume silently.
     if (auto tb = FindOutermostTaggedButton(Context); tb.widget) {
-        auto friendly = LookupButtonLabel(tb.tag);
-        std::wstring label = friendly.empty() ? Humanize(tb.tag)
-                                              : std::wstring(friendly);
-        std::wstring msg = L"Selected ";
-        msg += label;
-        Speech::Get().Announce(std::wstring_view(msg));
         return;
     }
 
-    // 3) Settings row: re-extract label + new value. Announce as the new
-    //    state. FocusUpdate (not Announce) so it interrupts cleanly and
-    //    plays the new value tightly after the prior speech.
+    // 3) Settings row: re-extract label + new value, speak as new state.
     if (auto* row = FindContainingRowWidget(Context)) {
         auto extracted = ExtractWidgetLabels(row);
         if (!extracted.empty()) {
@@ -954,16 +1211,7 @@ void HandleButtonClick(Unreal::UObject* Context, Unreal::FFrame& Stack) {
         }
     }
 
-    // 4) Humanized fallback.
-    std::wstring label;
-    if (auto* uw = OutermostUserWidget(Context)) {
-        auto cls_name = ClassNameOf(uw);
-        auto friendly = FriendlyNameFor(cls_name);
-        label = friendly.empty() ? Humanize(cls_name) : std::wstring(friendly);
-    }
-    std::wstring msg = L"Selected ";
-    msg += label.empty() ? L"button" : label;
-    Speech::Get().Announce(std::wstring_view(msg));
+    // 4) Unknown — silent.
 }
 
 // Designer-time placeholder fragments seen in Palworld widgets. If a
@@ -974,10 +1222,19 @@ bool IsNotificationPlaceholder(std::wstring_view t) {
     constexpr std::wstring_view kPlaceholders[] = {
         L"あいうえお", L"ABcdEFgh", L"ほげほげ", L"hogehoge",
         L"（仮）", L"Lorem ipsum", L"未完了は赤", L"パル名前",
+        L"クエスト名",          // "quest name" — quest title placeholder
+        L"クエスト",            // "quest" — generic fallback
+        L"クエストID",
+        L"ミッション名",        // "mission name"
+        L"NPC名",
     };
     for (auto p : kPlaceholders) {
         if (t.find(p) != std::wstring::npos) return true;
     }
+    // Designer-default distance placeholder used in quest list rows
+    // before the real distance binds. Exactly the strings "9999m",
+    // "9999 m", or the same with trailing characters.
+    if (t == L"9999m" || t == L"9999 m") return true;
     return false;
 }
 
@@ -1218,6 +1475,10 @@ void HandleSystemNotification(Unreal::UObject* Context, Unreal::FFrame& Stack) {
     // Skip sub-widgets that belong to UI we already handle.
     if (cn.starts_with(L"WBP_InventoryEquipment")) return;
     if (cn.starts_with(L"WBP_Menu_")) return;
+    // Quest start/clear popup is read by HandleQuestNotification via its
+    // inner text blocks — the parent widget exposes placeholder text
+    // (クエスト名) at Construct time which would announce as garbage.
+    if (cn == L"WBP_InGame_Quest_StartClear_C") return;
 
     auto fn = Stack.Node() ? Stack.Node()->GetName() : std::wstring();
 
@@ -1263,6 +1524,51 @@ void HandleSystemNotification(Unreal::UObject* Context, Unreal::FFrame& Stack) {
     Speech::Get().Announce(std::wstring_view(t));
 }
 
+// Quest start/clear notification. Two entry points:
+//   1. WBP_InGame_Quest_StartClear_C::Construct — the popup. Cache the
+//      widget so Hooks::Tick can poll its inner text blocks once the
+//      ubergraph resolves the placeholder.
+//   2. WBP_Ingame_QuestBoard_C::UpdateTrackingQuestDetail — fires right
+//      after mission start with the resolved title bound. Read the
+//      questboard's text content here as a more reliable source than
+//      the popup (which can keep the クエスト名 placeholder if the
+//      quest title is missing from Palworld's English locale data).
+void HandleQuestNotification(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    if (!Context) return;
+    auto* cls = Context->GetClassPrivate();
+    if (!cls) return;
+    auto cn = cls->GetName();
+
+    if (FunctionNameIs(Stack, L"Construct") &&
+        cn == L"WBP_InGame_Quest_StartClear_C") {
+        std::lock_guard<std::mutex> lock(g_quest_mtx);
+        g_quest_popup        = Context;
+        g_quest_construct_at = std::chrono::steady_clock::now();
+        g_quest_announced    = false;
+        return;
+    }
+
+    // Questboard tracker updated — the resolved title is rendered in
+    // its widget tree. Pull all visible text, log it for discovery,
+    // and let the popup poll consume the title from a sibling source
+    // if needed. We don't announce from here yet (avoid duplicates with
+    // the popup announce) but we DO log so we can confirm the field.
+    if (cn == L"WBP_Ingame_QuestBoard_C" &&
+        (FunctionNameIs(Stack, L"UpdateTrackingQuestDetail") ||
+         FunctionNameIs(Stack, L"UpdateQuestDetail"))) {
+        auto labels = ExtractWidgetLabels(Context, 0);
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] questboard update via {} labels=\"{}\"\n"),
+            Stack.Node() ? Stack.Node()->GetName() : L"<?>", labels);
+        // Hand it to the poll as a candidate title source.
+        std::lock_guard<std::mutex> lock(g_quest_mtx);
+        if (!g_quest_announced) {
+            g_questboard_labels = std::move(labels);
+            g_questboard_at     = std::chrono::steady_clock::now();
+        }
+    }
+}
+
 // Dialog body text. Only hook SetMainText: it has a known FText signature.
 // SetupUI on WBP_PalDialog_C has a different parameter layout (a config
 // struct, not FText) and blind-casting caused a crash on Confirm in world
@@ -1289,6 +1595,187 @@ std::wstring Hooks::ExtractAllText(Unreal::UObject* widget) {
     return ExtractWidgetLabels(widget, 0);
 }
 
+// Read the live FText value of a named text-block property on a widget.
+// Returns the resolved string or empty if the property is missing or the
+// FText is empty.
+static std::wstring ReadTextBlockText(Unreal::UObject* widget,
+                                      std::wstring_view block_property_name) {
+    if (!widget) return {};
+    auto* cls = widget->GetClassPrivate();
+    if (!cls) return {};
+    for (auto* prop : cls->ForEachPropertyInChain()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+        if (prop->GetName() != block_property_name) continue;
+        auto** child_ptr = prop->ContainerPtrToValuePtr<Unreal::UObject*>(widget);
+        if (!child_ptr || !*child_ptr) return {};
+        Unreal::UObject* tb = *child_ptr;
+        auto* tb_cls = tb->GetClassPrivate();
+        if (!tb_cls) return {};
+        // Walk the text block's own properties looking for an FText
+        // named "Text" (the standard UTextBlock field).
+        for (auto* tp : tb_cls->ForEachPropertyInChain()) {
+            if (!tp) continue;
+            if (tp->GetClass().GetName() != L"TextProperty") continue;
+            if (tp->GetName() != L"Text") continue;
+            auto* ftext = tp->ContainerPtrToValuePtr<Unreal::FText>(tb);
+            if (!ftext) return {};
+            return std::wstring(ftext->ToString());
+        }
+        return {};
+    }
+    return {};
+}
+
+// Per-frame poll. Drives two deferred-discovery flows:
+//   1. Patch-notes WebBrowser GetUrl polling (see g_news_*).
+//   2. Quest start/clear popup title polling (see g_quest_*) — reads
+//      Text_Quest_New / Text_Quest_Complete each tick until the
+//      ubergraph resolves the placeholder, then speaks the title.
+void Hooks::Tick() {
+    // ---- Quest start/clear poll ----
+    // Text_Quest_New / Text_Quest_Complete hold the static labels
+    // ("Mission Started" / "Mission Cleared"). The actual quest title
+    // lives in a different text block (likely something like
+    // Text_QuestTitle / Text_Description) reachable a level deeper in
+    // the widget tree. ExtractWidgetLabels walks 2 levels and joins
+    // every visible non-placeholder TextProperty with ", " — we wait
+    // for the joined string to grow beyond just the static labels and
+    // then split out the title.
+    {
+        std::lock_guard<std::mutex> lock(g_quest_mtx);
+        if (g_quest_popup && !g_quest_announced) {
+            auto* item = g_quest_popup->GetObjectItem();
+            if (!Unreal::UObjectArray::IsValid(item, /*evenIfPendingKill=*/false)) {
+                g_quest_popup = nullptr;
+            } else {
+                const auto now = std::chrono::steady_clock::now();
+                const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - g_quest_construct_at).count();
+                if (since > 3000) {
+                    g_quest_announced = true;
+                    g_quest_popup     = nullptr;
+                } else {
+                    auto split = [](const std::wstring& s) {
+                        std::vector<std::wstring> out;
+                        size_t start = 0;
+                        while (start < s.size()) {
+                            auto end = s.find(L", ", start);
+                            if (end == std::wstring::npos) {
+                                out.push_back(s.substr(start));
+                                break;
+                            }
+                            out.push_back(s.substr(start, end - start));
+                            start = end + 2;
+                        }
+                        return out;
+                    };
+                    auto popup_labels = ExtractWidgetLabels(g_quest_popup, 0);
+                    auto popup_frags  = split(popup_labels);
+
+                    bool saw_started = false, saw_cleared = false;
+                    std::wstring title;
+                    auto consider = [&](const std::vector<std::wstring>& frags) {
+                        for (auto& f : frags) {
+                            if (f.empty()) continue;
+                            if (IsNotificationPlaceholder(f)) continue;
+                            if (f == L"Mission Started" || f == L"MISSION STARTED" ||
+                                f == L"Quest Started"   || f == L"QUEST STARTED") {
+                                saw_started = true;
+                                continue;
+                            }
+                            if (f == L"Mission Cleared" || f == L"MISSION CLEARED" ||
+                                f == L"Mission Complete" || f == L"Quest Complete" ||
+                                f == L"Quest Cleared") {
+                                saw_cleared = true;
+                                continue;
+                            }
+                            if (title.empty()) title = f;
+                        }
+                    };
+                    consider(popup_frags);
+
+                    // Fallback: if the popup's text block still holds
+                    // the placeholder (which happens when Palworld's
+                    // English locale data is missing the title), pull
+                    // the title from the questboard tracker update that
+                    // fires around the same time.
+                    if (title.empty() && !g_questboard_labels.empty()) {
+                        consider(split(g_questboard_labels));
+                    }
+
+                    if ((saw_started || saw_cleared) && !title.empty()) {
+                        std::wstring msg = saw_started
+                            ? L"Mission started, " : L"Mission cleared, ";
+                        msg += title;
+                        Speech::Get().Announce(std::wstring_view(msg));
+                        Output::send<LogLevel::Default>(
+                            STR("[PalAccess] quest popup resolved: \"{}\" (popup=\"{}\" board=\"{}\")\n"),
+                            title, popup_labels, g_questboard_labels);
+                        g_quest_announced     = true;
+                        g_quest_popup         = nullptr;
+                        g_questboard_labels.clear();
+                    } else {
+                        // Per-poll snapshot log so we can see what's
+                        // actually in the widget at each tick. Throttled
+                        // by since-construct rounding.
+                        static long long s_last_log_ms = -1;
+                        long long bucket = since / 100;  // every 100 ms
+                        if (bucket != s_last_log_ms) {
+                            s_last_log_ms = bucket;
+                            Output::send<LogLevel::Default>(
+                                STR("[PalAccess] quest poll t={}ms popup=\"{}\" board=\"{}\"\n"),
+                                since, popup_labels, g_questboard_labels);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_news_mtx);
+    if (g_news_url_logged) return;
+    if (!g_news_inner) return;
+    auto* item = g_news_inner->GetObjectItem();
+    if (!Unreal::UObjectArray::IsValid(item, /*evenIfPendingKill=*/false)) {
+        g_news_inner = nullptr;
+        return;
+    }
+    // Bail after 5 seconds — if the URL still isn't set by then it
+    // probably never will be, and we don't want to spin forever.
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - g_news_construct_at).count() > 5000) {
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] gave up polling WebBrowser GetUrl after 5s\n"));
+        g_news_url_logged = true;
+        g_news_inner      = nullptr;
+        return;
+    }
+    auto* func = g_news_inner->GetFunctionByName(L"GetUrl");
+    if (!func) {
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] WebBrowser has no GetUrl UFunction\n"));
+        g_news_url_logged = true;
+        g_news_inner      = nullptr;
+        return;
+    }
+    struct Parms { Unreal::FString Ret; };
+    Parms p{};
+    g_news_inner->ProcessEvent(func, &p);
+    if (p.Ret.IsEmpty()) return;  // not loaded yet — keep polling
+    const wchar_t* url_c = p.Ret.GetCharArray().GetData();
+    if (!url_c) return;
+    Output::send<LogLevel::Default>(
+        STR("[PalAccess] WebBrowser_News URL: \"{}\"\n"), url_c);
+    // Kick the fetcher with the captured URL. It runs on a background
+    // thread, strips HTML, filters to English paragraphs, and queues them
+    // through Speech::Queue.
+    PatchNotes::Fetch(std::wstring_view(url_c));
+    g_news_url_logged = true;
+    g_news_inner      = nullptr;
+}
+
 void Hooks::Install() {
     Unreal::Hook::RegisterBeginPlayPostCallback(&OnActorBeginPlay);
     Unreal::Hook::RegisterProcessLocalScriptFunctionPostCallback(&OnPostScriptFunction);
@@ -1311,12 +1798,10 @@ void Hooks::OnActorBeginPlay(Unreal::AActor* Context) {
     }
     Hotkeys::NoticePotentialPlayer(Context);
 
-    if (ClassNameStartsWith(Context, L"BP_PalPlayerController_Title")) {
-        // Fires once when the title-screen player controller arrives.
-        // Slight delay would be nice but we don't have a timer; the speech
-        // dedup makes a repeated greet harmless.
-        Speech::Get().Announce(L"Welcome to Palworld. Main menu loading.");
-    }
+    // The "Welcome to Palworld. Main menu loading." announce that used
+    // to fire here was removed — it competed with the patch-notes
+    // screen's announce in the same cluster window and pushed it back.
+    // Patch notes is the first useful event on launch.
 }
 
 // ---- ProcessLocalScriptFunction post-callback ------------------------------
@@ -1329,6 +1814,7 @@ PALACCESS_UFUNC_HOOK(Hooks::OnPostScriptFunction) {
     HandleButtonHover(Context, Stack);
     HandleButtonClick(Context, Stack);
     HandleDialogText(Context, Stack);
+    HandleQuestNotification(Context, Stack);
     HandleSystemNotification(Context, Stack);
     HandleConstructionInfoUpdate(Context, Stack);
     HandleConstructionItemFocus(Context, Stack);

@@ -25,6 +25,11 @@ public:
     // Exposed so Hotkeys can read the HUD HP/Hunger/Stamina gauge widgets.
     static std::wstring ExtractAllText(RC::Unreal::UObject* widget);
 
+    // Per-frame poll used by deferred discovery — currently polls the
+    // patch-notes WebBrowser's GetUrl() until it returns non-empty so we
+    // can log the URL Palworld serves the news from.
+    static void Tick();
+
 private:
     // Fires post-BeginPlay for every AActor in the world. We use it to discover
     // Pal/NPC/widget actors and to register per-actor hooks (focus events,

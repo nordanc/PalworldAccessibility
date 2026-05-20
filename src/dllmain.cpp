@@ -51,6 +51,8 @@ public:
 
     auto on_update() -> void override {
         PalAccess::Hotkeys::Tick();
+        PalAccess::Hooks::Tick();
+        PalAccess::Speech::Get().Tick();
     }
 };
 
