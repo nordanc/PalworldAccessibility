@@ -740,6 +740,35 @@ void HandleButtonSetText(Unreal::UObject* Context, Unreal::FFrame& Stack) {
         class_name, str);
 }
 
+// Forward declarations for helpers defined later in the same TU; needed
+// because HandleButtonHover (below) post-processes the extracted row
+// labels with these.
+std::wstring        StripRichTextMarkup(std::wstring_view s);
+std::wstring        HumanizeRichTextId(std::wstring_view id);
+bool                IsNotificationPlaceholder(std::wstring_view t);
+Unreal::UFunction*  FindFunctionInChain(Unreal::UObject* obj,
+                                        std::wstring_view fname);
+
+// Last hovered recipe slot — used by the click handler to know which
+// recipe's materials to read when the player activates one.
+Unreal::UObject*                              g_last_recipe_slot = nullptr;
+std::chrono::steady_clock::time_point         g_last_recipe_slot_t;
+
+// Shared dedup state for recipe-name announces. Lifted to file scope so
+// the click handler can mark a name as "just spoken" — that suppresses
+// the hover handler's rapid re-fire when Palworld's click flow re-calls
+// GetRecipeId several times in quick succession.
+std::mutex                                    g_recipe_speech_mtx;
+std::wstring                                  g_recipe_last_msg;
+std::chrono::steady_clock::time_point         g_recipe_last_msg_t;
+
+// Slot that the materials line was last announced for. Reset to nullptr
+// whenever the hover handler observes the user moving to a different
+// slot. Lets the click handler skip Palworld's repeated
+// CommonButtonBaseClicked fires on the same focused slot, while still
+// re-announcing when the user navigates away and returns.
+Unreal::UObject*                              g_click_announced_slot = nullptr;
+
 // User hovered or focused a button. Triggered by any of the focus-style
 // animation events Palworld fires:
 //   BP_OnHovered     — mouse hover, UE5 CommonUI default
@@ -753,6 +782,18 @@ void HandleButtonHover(Unreal::UObject* Context, Unreal::FFrame& Stack) {
     // which reads the side info panel; otherwise the generic hover path
     // here would just announce "Construction" (the humanized class name).
     if (ClassNameOf(Context) == L"WBP_IngameMenu_Construction_Icon_C") return;
+    // Inventory item slot buttons handled by HandleInventorySlotFocus.
+    // Hover/focus events fire on the slot button itself AND on its inner
+    // child widgets (WBP_PalInvisibleButton_C, etc.). Walk up the outer
+    // chain to detect the slot button at any depth so the generic hover
+    // path doesn't double-announce on top of HandleInventorySlotFocus.
+    if (auto* uw = OutermostUserWidget(Context); uw) {
+        auto uw_cls = ClassNameOf(uw);
+        if (uw_cls == L"WBP_PalInGameMenuItemSlotButton_C" ||
+            uw_cls == L"WBP_PalConvertItemMenu_RecipeSlotButton_C") {
+            return;
+        }
+    }
 
     // 1) Dynamic SetText cache — handles popup buttons like "Close", "OK".
     if (auto label = ButtonTextCache::Get().Lookup(Context); !label.empty()) {
@@ -790,7 +831,38 @@ void HandleButtonHover(Unreal::UObject* Context, Unreal::FFrame& Stack) {
             Output::send<LogLevel::Verbose>(
                 STR("[PalAccess] row labels: {} = \"{}\"\n"),
                 ClassNameOf(row), extracted);
-            Speech::Get().FocusUpdate(std::wstring_view(extracted));
+            // Strip Palworld's rich-text markup (<itemName id="..."/>,
+            // <mapObjectName id="..."/>) and collapse consecutive
+            // duplicate ", "-separated fragments. Without this, tech
+            // tree rows speak as
+            // "Structures, <mapObjectName id=\"WorkBench\"/>, <mapObjectName id=\"WorkBench\"/>, 前提未取得, 1"
+            std::wstring cleaned = StripRichTextMarkup(extracted);
+            // Split, drop placeholders + adjacent duplicates, rejoin.
+            std::vector<std::wstring> parts;
+            size_t start = 0;
+            while (start <= cleaned.size()) {
+                auto pos = cleaned.find(L", ", start);
+                std::wstring frag = (pos == std::wstring::npos)
+                    ? cleaned.substr(start)
+                    : cleaned.substr(start, pos - start);
+                // Trim leading/trailing whitespace from each fragment.
+                while (!frag.empty() && (frag.front() == L' ' || frag.front() == L'\t')) frag.erase(frag.begin());
+                while (!frag.empty() && (frag.back()  == L' ' || frag.back()  == L'\t')) frag.pop_back();
+                if (!frag.empty() &&
+                    !IsNotificationPlaceholder(frag) &&
+                    (parts.empty() || parts.back() != frag)) {
+                    parts.push_back(std::move(frag));
+                }
+                if (pos == std::wstring::npos) break;
+                start = pos + 2;
+            }
+            std::wstring final_text;
+            for (size_t i = 0; i < parts.size(); ++i) {
+                if (i) final_text += L", ";
+                final_text += parts[i];
+            }
+            if (final_text.empty()) return;
+            Speech::Get().FocusUpdate(std::wstring_view(final_text));
             return;
         }
     }
@@ -911,6 +983,122 @@ void HandleScreenArrival(Unreal::UObject* Context, Unreal::FFrame& Stack) {
     // Cache HUD gauge widgets so the F1/F2/F3 hotkeys can read their
     // displayed cur/max text even when SaveParameter's max is unpopulated.
     Hotkeys::NoticePotentialGaugeWidget(Context);
+
+    // Recipe / craft widget discovery — log any class whose name
+    // contains Recipe / Craft (not the ones we already know about)
+    // the first time it constructs. Used to find the focusable widget
+    // class at the workbench / cooking pot / etc.
+    if (FunctionNameIs(Stack, L"Construct") &&
+        (name.starts_with(L"WBP_") || name.starts_with(L"W_"))) {
+        const bool looks_recipe =
+            (name.find(L"Recipe") != std::wstring::npos ||
+             name.find(L"Craft")  != std::wstring::npos ||
+             name.find(L"Cook")   != std::wstring::npos) &&
+            !name.ends_with(L"Button_C") &&
+            !name.ends_with(L"Icon_C") &&
+            !name.ends_with(L"_btn_C") &&
+            !name.ends_with(L"Cursor_C");
+        if (looks_recipe) {
+            static std::mutex                       s_r_mtx;
+            static std::unordered_set<std::wstring> s_r_seen;
+            std::lock_guard<std::mutex> lock(s_r_mtx);
+            if (s_r_seen.insert(name).second) {
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess] recipe/craft widget construct: {}\n"), name);
+                // Also dump its properties so we can spot a GetTargetSlot
+                // or similar method on it.
+                auto* dcls = Context->GetClassPrivate();
+                if (dcls) {
+                    int n = 0;
+                    for (auto* prop : dcls->ForEachPropertyInChain()) {
+                        if (!prop) continue;
+                        if (++n > 80) break;
+                        auto ptype = prop->GetClass().GetName();
+                        auto pname = prop->GetName();
+                        if (ptype == L"ObjectProperty") {
+                            auto** child = prop->ContainerPtrToValuePtr<Unreal::UObject*>(Context);
+                            auto cn3 = (child && *child && (*child)->GetClassPrivate())
+                                ? (*child)->GetClassPrivate()->GetName() : L"<null>";
+                            Output::send<LogLevel::Default>(
+                                STR("[PalAccess]   {} {} -> {}\n"), ptype, pname, cn3);
+                        } else {
+                            Output::send<LogLevel::Default>(
+                                STR("[PalAccess]   {} {}\n"), ptype, pname);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Inventory + Pal slot discovery dumps. Each widget's properties
+    // (and the class names of any ObjectProperty children) are logged
+    // exactly once per class to UE4SS.log, so we can see in the user's
+    // build where item / pal data is held. Pure logging — no spoken
+    // output, no functional change. Remove once the property layout
+    // for each is pinned in code.
+    if (FunctionNameIs(Stack, L"Construct")) {
+        struct DiscoveryTarget {
+            std::wstring_view klass;
+            bool              dive_into_children;  // also list each ObjectProperty child's class properties
+        };
+        static const DiscoveryTarget kTargets[] = {
+            { L"WBP_PalInGameMenuItemSlotButton_C",   true  },
+            { L"WBP_PalInGameMenuItemSlot_C",         true  },
+            { L"WBP_PalCommonCharacterSlot_C",        true  },
+            { L"WBP_PalCommonCharacterSlotButton_C",  true  },
+            { L"WBP_InventoryEquipment_ItemInfo_C",   false },
+            { L"WBP_Menu_PalList_C",                  false },
+            { L"WBP_PalPlayerInventoryScrollList_C",  false },
+        };
+        for (const auto& target : kTargets) {
+            if (name != target.klass) continue;
+            static std::mutex                       s_disc_mtx;
+            static std::unordered_set<std::wstring> s_disc_seen;
+            {
+                std::lock_guard<std::mutex> lock(s_disc_mtx);
+                if (!s_disc_seen.insert(std::wstring(target.klass)).second) break;
+            }
+            Output::send<LogLevel::Default>(
+                STR("[PalAccess] === discovery {} props ===\n"), target.klass);
+            int n = 0;
+            for (auto* prop : cls->ForEachPropertyInChain()) {
+                if (!prop) continue;
+                if (++n > 250) break;
+                auto ptype = prop->GetClass().GetName();
+                auto pname = prop->GetName();
+                // For ObjectProperty, follow the pointer and report the
+                // child's class name so we know what's bound to slots
+                // (UPalItemSlot vs widget vs character handle, etc.).
+                if (ptype == L"ObjectProperty") {
+                    auto** child = prop->ContainerPtrToValuePtr<Unreal::UObject*>(Context);
+                    Unreal::UObject* c = (child && *child) ? *child : nullptr;
+                    auto cn = (c && c->GetClassPrivate())
+                        ? c->GetClassPrivate()->GetName() : L"<null>";
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess]   {} {} -> {}\n"), ptype, pname, cn);
+                    if (target.dive_into_children && c && c->GetClassPrivate()) {
+                        auto* sub_cls = c->GetClassPrivate();
+                        int m = 0;
+                        for (auto* sp : sub_cls->ForEachPropertyInChain()) {
+                            if (!sp) continue;
+                            if (++m > 80) {
+                                Output::send<LogLevel::Default>(STR("[PalAccess]       ...\n"));
+                                break;
+                            }
+                            Output::send<LogLevel::Default>(
+                                STR("[PalAccess]       {} {}\n"),
+                                sp->GetClass().GetName(), sp->GetName());
+                        }
+                    }
+                } else {
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess]   {} {}\n"), ptype, pname);
+                }
+            }
+            break;
+        }
+    }
 
     // Cache the inner WebBrowserWidget for the patch-notes panel. Tick()
     // will poll GetUrl() on it until the URL becomes available, so we
@@ -1227,6 +1415,11 @@ bool IsNotificationPlaceholder(std::wstring_view t) {
         L"クエストID",
         L"ミッション名",        // "mission name"
         L"NPC名",
+        L"前提未取得",          // "prerequisite not obtained" — tech tree locked label
+        L"未習得",              // "not learned" — tech tree locked label
+        L"未開放",              // "not unlocked"
+        L"アイテム名",          // "item name"
+        L"施設名",              // "facility name"
     };
     for (auto p : kPlaceholders) {
         if (t.find(p) != std::wstring::npos) return true;
@@ -1246,6 +1439,24 @@ std::mutex                                    g_construction_mtx;
 std::wstring                                  g_construction_last;
 std::chrono::steady_clock::time_point         g_construction_last_t{};
 
+// Inventory: cache the alive WBP_InventoryEquipment_ItemInfo_C so slot
+// focus can read its RichText_ItemName for the localized item name
+// (Palworld populates it during the slot's hover handler — by the time
+// our focus dispatcher fires, the text has resolved). Reset to nullptr
+// on Destruct.
+Unreal::UObject*                              g_inv_item_info = nullptr;
+std::mutex                                    g_inv_mtx;
+Unreal::UObject*                              g_inv_last_slot = nullptr;
+std::chrono::steady_clock::time_point         g_inv_last_slot_t{};
+// Name-based dedup: when an inventory has multiple slots of the same
+// item (multiple stacks of Red Berries, Wood, etc.) each slot has its
+// own widget pointer, so pointer dedup can't suppress the re-announce
+// when the user arrows between them. Within this window the same
+// computed message is skipped — slower browsing past adjacent same-
+// item slots produces one announce, not N.
+std::wstring                                  g_inv_last_msg;
+std::chrono::steady_clock::time_point         g_inv_last_msg_t{};
+
 // The parent panel — shows the build object's NAME + description. This is
 // what we want to announce. InfoItem (single material row) is its child and
 // just shows numbers like "6, 2, Wood".
@@ -1261,16 +1472,80 @@ bool IsConstructionInfoPanel(std::wstring_view cn) {
 // Strip Palworld's inline rich-text tags (e.g. `<mapObjectName id="WorkBench"/>`)
 // and collapse whitespace so the read-out doesn't trip over markup or
 // embedded newlines.
+// Convert a CamelCase / under_score class-id token into a spoken phrase.
+// "WorkBench" -> "Work bench", "PalSphere" -> "Pal sphere",
+// "Axe_Tier_00" -> "Axe tier", "RedBerries" -> "Red berries".
+std::wstring HumanizeRichTextId(std::wstring_view id) {
+    std::wstring out;
+    out.reserve(id.size() + 4);
+    for (size_t i = 0; i < id.size(); ++i) {
+        wchar_t c = id[i];
+        if (c == L'_') { out.push_back(L' '); continue; }
+        if (i > 0 && c >= L'A' && c <= L'Z') {
+            wchar_t prev = id[i - 1];
+            bool prev_lower = prev >= L'a' && prev <= L'z';
+            bool prev_digit = prev >= L'0' && prev <= L'9';
+            if (prev_lower || prev_digit) out.push_back(L' ');
+        }
+        out.push_back(c);
+    }
+    // Trim trailing digits / spaces (Tier_00 -> "Tier ").
+    while (!out.empty() &&
+           (std::iswdigit(out.back()) || out.back() == L' '))
+        out.pop_back();
+    if (out.empty()) return {};
+    // Lowercase everything after the first character so the output
+    // reads naturally instead of "Work Bench Skill".
+    out[0] = std::towupper(out[0]);
+    for (size_t i = 1; i < out.size(); ++i) out[i] = std::towlower(out[i]);
+    return out;
+}
+
 std::wstring StripRichTextMarkup(std::wstring_view s) {
     std::wstring tmp;
     tmp.reserve(s.size());
-    bool in_tag = false;
-    for (wchar_t c : s) {
-        if (c == L'<') { in_tag = true; continue; }
-        if (c == L'>') { in_tag = false; continue; }
-        if (in_tag) continue;
-        if (c == L'\n' || c == L'\r' || c == L'\t') c = L' ';
-        tmp.push_back(c);
+    // Two-pass approach: scan for tags, substitute the body text or
+    // (when self-closing) the id="..." attribute humanized. Without
+    // this, Palworld's tech-tree rows speak as empty after markup
+    // strip because the only readable token is in id="WorkBench".
+    size_t i = 0;
+    while (i < s.size()) {
+        wchar_t c = s[i];
+        if (c != L'<') {
+            if (c == L'\n' || c == L'\r' || c == L'\t') c = L' ';
+            tmp.push_back(c);
+            ++i;
+            continue;
+        }
+        // Found a tag opening. Find its closing '>'.
+        auto end = s.find(L'>', i + 1);
+        if (end == std::wstring_view::npos) break;  // malformed; bail
+        std::wstring_view tag_inner = s.substr(i + 1, end - i - 1);
+        // If this tag has an id="..." attribute, capture it (used as
+        // fallback when the tag is self-closing and has no body).
+        std::wstring_view id_val;
+        if (auto idp = tag_inner.find(L"id=\""); idp != std::wstring_view::npos) {
+            idp += 4;
+            auto endq = tag_inner.find(L'"', idp);
+            if (endq != std::wstring_view::npos) {
+                id_val = tag_inner.substr(idp, endq - idp);
+            }
+        }
+        const bool self_closing =
+            !tag_inner.empty() && tag_inner.back() == L'/';
+        if (self_closing) {
+            // Self-closing -- speak the id attribute, humanized.
+            if (!id_val.empty()) {
+                tmp += HumanizeRichTextId(id_val);
+            }
+            i = end + 1;
+            continue;
+        }
+        // Open tag (e.g. <itemName id="X">Spear</itemName>). Skip to
+        // the matching closing tag, keeping the body in the output.
+        i = end + 1;  // step past the open tag
+        // Body until '<' is what we want to preserve as-is.
+        // The outer loop will handle the next tag (closing) and skip it.
     }
     // Collapse runs of whitespace and trim.
     std::wstring out;
@@ -1429,13 +1704,47 @@ void HandleConstructionTabSelect(Unreal::UObject* Context, Unreal::FFrame& Stack
     if (!Context) return;
     if (ClassNameOf(Context) != L"WBP_IngameMenu_Construction_Tab_C") return;
     if (!FunctionNameIs(Stack, L"AnmEvent_Select")) return;
-    DumpPropertiesOnce(Context);
-    auto txt = ExtractWidgetLabels(Context, 0);
+    // Read Text_Category directly — that's the BP_PalTextBlock child
+    // holding the category name (Production, Foundation, Defense, etc.)
+    // Per the props dump on this class.
+    std::wstring txt;
+    auto* cls = Context->GetClassPrivate();
+    if (cls) {
+        for (auto* prop : cls->ForEachPropertyInChain()) {
+            if (!prop) continue;
+            if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+            if (prop->GetName() != L"Text_Category") continue;
+            auto** ptr = prop->ContainerPtrToValuePtr<Unreal::UObject*>(Context);
+            if (ptr && *ptr) txt = ReadChildTextOrLabel(*ptr);
+            break;
+        }
+    }
+    if (txt.empty()) {
+        // Fallback: ExtractWidgetLabels in case Text_Category was
+        // hidden or empty (different Palworld build / icon-only tab).
+        txt = ExtractWidgetLabels(Context, 0);
+    }
     if (txt.empty() || IsNotificationPlaceholder(txt)) return;
     if (txt.size() > 120) return;
-    Output::send<LogLevel::Verbose>(
+    // Per-tab debounce — Palworld fires AnmEvent_Select more than once
+    // for one logical tab change (animation + selection events).
+    static std::mutex                                                              s_ctab_mtx;
+    static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> s_ctab_at;
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(s_ctab_mtx);
+        auto it = s_ctab_at.find(txt);
+        if (it != s_ctab_at.end()) {
+            const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second).count();
+            if (since < 400) return;
+        }
+        s_ctab_at[txt] = now;
+    }
+    Output::send<LogLevel::Default>(
         STR("[PalAccess] construction tab: \"{}\"\n"), txt);
-    Speech::Get().Announce(std::wstring_view(txt));
+    Speech::Get().NotifyScreenArrival();
+    Speech::Get().SpeakNow(std::wstring_view(txt));
 }
 
 // Item navigation: when an icon is hovered or the Group fires its bound
@@ -1453,6 +1762,1150 @@ void HandleConstructionItemFocus(Unreal::UObject* Context, Unreal::FFrame& Stack
          fn.find(L"OnHoveredAnyBuildObjectIcon") != std::wstring::npos);
     if (!is_focus_event) return;
     AnnounceConstructionInfoFromPanel(g_construction_info_panel);
+}
+
+// Recipe slot focus (crafting stations: workbench, primitive furnace,
+// cooking pot, etc.). Mirror of the inventory-slot handler:
+//   - WBP_PalConvertItemMenu_RecipeSlotButton_C::GetRecipeId is the
+//     getter for the bound recipe.
+//   - Return value is either an FName (recipe id) or a struct holding
+//     one — we handle both via reflection.
+//   - Humanize the raw id (e.g. "Recipe_WoodPlank" -> "Wood plank")
+//     and announce via FocusUpdate.
+void HandleRecipeSlotFocus(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    if (!Context) return;
+    auto cn = ClassNameOf(Context);
+    auto fn = Stack.Node() ? Stack.Node()->GetName() : std::wstring();
+    // Recipe slot widgets in this menu don't fire the standard
+    // AnmEvent_Focus / BP_OnHovered. Palworld signals "this slot is
+    // being inspected" by calling GetRecipeId on the slot widget and
+    // by firing OnHoveredRecipeSlot on the workspace container. Use
+    // either as the trigger.
+    const bool is_recipe_trigger =
+        (cn == L"WBP_PalConvertItemMenu_RecipeSlotButton_C" &&
+         fn == L"GetRecipeId") ||
+        (cn == L"WBP_IngameMenu_WorkSpace_C" &&
+         fn == L"OnHoveredRecipeSlot");
+    if (!is_recipe_trigger) return;
+    // For the workspace OnHoveredRecipeSlot path Context isn't the
+    // slot widget itself; we need to read the slot reference from
+    // its parameter. For now only act when Context IS the slot widget
+    // (the GetRecipeId path) — that's the common case.
+    if (cn != L"WBP_PalConvertItemMenu_RecipeSlotButton_C") return;
+
+    // Pointer dedup (~800 ms): Palworld's click flow re-invokes
+    // GetRecipeId several times on the same slot in quick succession,
+    // and the announcement chain below interrupts itself mid-word each
+    // time. The wider window catches those bursts without making
+    // legitimate D-pad navigation feel laggy.
+    static std::mutex                                   s_mtx;
+    static Unreal::UObject*                             s_last_slot = nullptr;
+    static std::chrono::steady_clock::time_point        s_last_slot_t;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(s_mtx);
+        if (Context == s_last_slot &&
+            now - s_last_slot_t < std::chrono::milliseconds(800)) return;
+        // User moved to a different slot — clear the click handler's
+        // "already announced" flag so a click on the new slot fires,
+        // and a future return to a previously-announced slot fires
+        // again as a fresh visit.
+        if (Context != s_last_slot) g_click_announced_slot = nullptr;
+        s_last_slot   = Context;
+        s_last_slot_t = now;
+    }
+
+    auto* func = FindFunctionInChain(Context, L"GetRecipeId");
+    if (!func) return;
+    const size_t ps = func->GetPropertiesSize();
+    if (ps == 0 || ps > 256) return;
+    std::vector<uint8_t> buf(ps, 0);
+    Context->ProcessEvent(func, buf.data());
+
+    // The return parameter is either a NameProperty or a StructProperty
+    // wrapping a NameProperty (FPalRecipeId or similar). Try both.
+    std::wstring raw;
+    // GetRecipeId returns a single FName (or a struct wrapping one).
+    // First try the StructProperty case (same shape as GetItemId).
+    for (auto* prop : func->ForEachProperty()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"StructProperty") continue;
+        auto* sp = reinterpret_cast<Unreal::FStructProperty*>(prop);
+        auto* inner = sp->GetStruct().Get();
+        if (!inner) continue;
+        auto* struct_data = prop->ContainerPtrToValuePtr<uint8_t>(buf.data());
+        if (!struct_data) continue;
+        for (auto* leaf : inner->ForEachProperty()) {
+            if (!leaf) continue;
+            if (leaf->GetClass().GetName() != L"NameProperty") continue;
+            auto* fname = leaf->ContainerPtrToValuePtr<Unreal::FName>(struct_data);
+            if (fname) {
+                auto s = std::wstring(fname->ToString());
+                if (!s.empty() && s != L"None") { raw = std::move(s); break; }
+            }
+        }
+        if (!raw.empty()) break;
+    }
+    // Fallback: top-level NameProperty return value.
+    if (raw.empty()) {
+        for (auto* prop : func->ForEachProperty()) {
+            if (!prop) continue;
+            if (prop->GetClass().GetName() != L"NameProperty") continue;
+            auto* fname = prop->ContainerPtrToValuePtr<Unreal::FName>(buf.data());
+            if (fname) {
+                auto s = std::wstring(fname->ToString());
+                if (!s.empty() && s != L"None") { raw = std::move(s); break; }
+            }
+        }
+    }
+    if (raw.empty()) return;
+
+    // Try the live WBP_PalCraftInfo_C info panel's Text_ItemName for
+    // the localized display name. Palworld writes the resolved name
+    // there on each hover, regardless of how the FName maps. Falls
+    // back to the humanized raw FName when the panel can't be read.
+    std::wstring resolved;
+    Unreal::UObject* info_panel = nullptr;
+    Unreal::UObjectGlobals::ForEachUObject(
+        [&](Unreal::UObject* obj, int32_t, int32_t) -> LoopAction {
+            if (info_panel || !obj) return LoopAction::Continue;
+            if (obj->GetName().starts_with(L"Default__")) return LoopAction::Continue;
+            auto* ocls = obj->GetClassPrivate();
+            if (ocls && ocls->GetName() == L"WBP_PalCraftInfo_C") {
+                info_panel = obj;
+                return LoopAction::Break;
+            }
+            return LoopAction::Continue;
+        });
+    if (info_panel) {
+        auto* pcls = info_panel->GetClassPrivate();
+        if (pcls) {
+            for (auto* prop : pcls->ForEachPropertyInChain()) {
+                if (!prop) continue;
+                if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+                if (prop->GetName() != L"Text_ItemName") continue;
+                auto** ptr = prop->ContainerPtrToValuePtr<Unreal::UObject*>(info_panel);
+                if (!ptr || !*ptr) break;
+                Unreal::UObject* tb = *ptr;
+                auto* tbc = tb->GetClassPrivate();
+                if (!tbc) break;
+                for (auto* tp : tbc->ForEachPropertyInChain()) {
+                    if (!tp) continue;
+                    if (tp->GetClass().GetName() != L"TextProperty") continue;
+                    if (tp->GetName() != L"Text") continue;
+                    auto* ftext = tp->ContainerPtrToValuePtr<Unreal::FText>(tb);
+                    if (ftext) {
+                        auto s = std::wstring(ftext->ToString());
+                        if (!s.empty() && !IsPlaceholderText(s) &&
+                            !IsNotificationPlaceholder(s)) {
+                            resolved = StripRichTextMarkup(s);
+                        }
+                    }
+                    break;
+                }
+                break;
+            }
+        }
+    }
+
+    auto name = resolved.empty() ? HumanizeRichTextId(raw) : resolved;
+    Output::send<LogLevel::Default>(
+        STR("[PalAccess] recipe-focus raw=\"{}\" -> \"{}\"\n"), raw, name);
+    // Message dedup against the shared recipe-speech state — same name
+    // within 2.5 s is suppressed regardless of whether it was the hover
+    // or the click handler that last spoke it. The click flow announces
+    // "<name>. Requires …" which starts with the name, so a subsequent
+    // hover with just the name would be redundant.
+    {
+        std::lock_guard<std::mutex> lock(g_recipe_speech_mtx);
+        if (now - g_recipe_last_msg_t < std::chrono::milliseconds(2500) &&
+            (name == g_recipe_last_msg ||
+             g_recipe_last_msg.starts_with(name))) return;
+        g_recipe_last_msg   = name;
+        g_recipe_last_msg_t = now;
+    }
+    Speech::Get().FocusUpdate(std::wstring_view(name));
+    // Cache the currently-hovered recipe slot so the click handler
+    // below can read its MatMap when the player activates it.
+    g_last_recipe_slot   = Context;
+    g_last_recipe_slot_t = now;
+}
+
+// Resolve a recipe slot's display name. Mirrors the logic used in
+// HandleRecipeSlotFocus: pull the raw FName via GetRecipeId, then look
+// up the live WBP_PalCraftInfo_C panel's Text_ItemName for the localized
+// player-facing name. Falls back to humanized raw FName if the panel
+// can't be read.
+std::wstring ResolveRecipeDisplayName(Unreal::UObject* slot) {
+    if (!slot) return {};
+    std::wstring raw;
+    auto* func = FindFunctionInChain(slot, L"GetRecipeId");
+    if (func) {
+        const size_t ps = func->GetPropertiesSize();
+        if (ps > 0 && ps <= 256) {
+            std::vector<uint8_t> buf(ps, 0);
+            slot->ProcessEvent(func, buf.data());
+            for (auto* prop : func->ForEachProperty()) {
+                if (!prop) continue;
+                if (prop->GetClass().GetName() == L"StructProperty") {
+                    auto* sp = reinterpret_cast<Unreal::FStructProperty*>(prop);
+                    auto* inner = sp->GetStruct().Get();
+                    if (!inner) continue;
+                    auto* sd = prop->ContainerPtrToValuePtr<uint8_t>(buf.data());
+                    if (!sd) continue;
+                    for (auto* leaf : inner->ForEachProperty()) {
+                        if (!leaf) continue;
+                        if (leaf->GetClass().GetName() != L"NameProperty") continue;
+                        auto* fname =
+                            leaf->ContainerPtrToValuePtr<Unreal::FName>(sd);
+                        if (fname) {
+                            auto s = std::wstring(fname->ToString());
+                            if (!s.empty() && s != L"None") {
+                                raw = std::move(s);
+                                break;
+                            }
+                        }
+                    }
+                    if (!raw.empty()) break;
+                } else if (prop->GetClass().GetName() == L"NameProperty") {
+                    auto* fname =
+                        prop->ContainerPtrToValuePtr<Unreal::FName>(buf.data());
+                    if (fname) {
+                        auto s = std::wstring(fname->ToString());
+                        if (!s.empty() && s != L"None") {
+                            raw = std::move(s);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::wstring resolved;
+    Unreal::UObject* info_panel = nullptr;
+    Unreal::UObjectGlobals::ForEachUObject(
+        [&](Unreal::UObject* obj, int32_t, int32_t) -> LoopAction {
+            if (info_panel || !obj) return LoopAction::Continue;
+            if (obj->GetName().starts_with(L"Default__")) return LoopAction::Continue;
+            auto* ocls = obj->GetClassPrivate();
+            if (ocls && ocls->GetName() == L"WBP_PalCraftInfo_C") {
+                info_panel = obj;
+                return LoopAction::Break;
+            }
+            return LoopAction::Continue;
+        });
+    if (info_panel) {
+        auto* pcls = info_panel->GetClassPrivate();
+        if (pcls) {
+            for (auto* prop : pcls->ForEachPropertyInChain()) {
+                if (!prop) continue;
+                if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+                if (prop->GetName() != L"Text_ItemName") continue;
+                auto** ptr =
+                    prop->ContainerPtrToValuePtr<Unreal::UObject*>(info_panel);
+                if (!ptr || !*ptr) break;
+                Unreal::UObject* tb = *ptr;
+                auto* tbc = tb->GetClassPrivate();
+                if (!tbc) break;
+                for (auto* tp : tbc->ForEachPropertyInChain()) {
+                    if (!tp) continue;
+                    if (tp->GetClass().GetName() != L"TextProperty") continue;
+                    if (tp->GetName() != L"Text") continue;
+                    auto* ftext = tp->ContainerPtrToValuePtr<Unreal::FText>(tb);
+                    if (ftext) {
+                        auto s = std::wstring(ftext->ToString());
+                        if (!s.empty() && !IsPlaceholderText(s) &&
+                            !IsNotificationPlaceholder(s)) {
+                            resolved = StripRichTextMarkup(s);
+                        }
+                    }
+                    break;
+                }
+                break;
+            }
+        }
+    }
+
+    if (!resolved.empty()) return resolved;
+    if (!raw.empty()) return HumanizeRichTextId(raw);
+    return {};
+}
+
+// Read the materials map (MatMap) off a recipe slot button via reflection.
+// MatMap is a TMap<FPalItemId, int32> (or TMap<FName, int32> in some
+// variants): key = ingredient item id, value = required count.
+struct RecipeMaterial { std::wstring name; int32_t count; };
+
+std::vector<RecipeMaterial> ReadRecipeMaterials(Unreal::UObject* slot) {
+    std::vector<RecipeMaterial> out;
+    if (!slot) return out;
+    auto* cls = slot->GetClassPrivate();
+    if (!cls) return out;
+    for (auto* prop : cls->ForEachPropertyInChain()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"MapProperty") continue;
+        if (prop->GetName() != L"MatMap") continue;
+        auto* map_prop = static_cast<Unreal::FMapProperty*>(prop);
+        auto* key_prop = map_prop->GetKeyProp();
+        auto* val_prop = map_prop->GetValueProp();
+        if (!key_prop || !val_prop) break;
+        const auto& layout = map_prop->GetMapLayout();
+        auto* sm = map_prop->ContainerPtrToValuePtr<Unreal::FScriptMap>(slot);
+        if (!sm) break;
+        const int32_t max_index = sm->GetMaxIndex();
+        const auto key_cls = key_prop->GetClass().GetName();
+        const auto val_cls = val_prop->GetClass().GetName();
+        for (int32_t i = 0; i < max_index; ++i) {
+            if (!sm->IsValidIndex(i)) continue;
+            uint8_t* pair = static_cast<uint8_t*>(sm->GetData(i, layout));
+            if (!pair) continue;
+
+            std::wstring key_name;
+            if (key_cls == L"NameProperty") {
+                auto* fname = reinterpret_cast<Unreal::FName*>(pair);
+                if (fname) {
+                    auto s = std::wstring(fname->ToString());
+                    if (!s.empty() && s != L"None") key_name = s;
+                }
+            } else if (key_cls == L"StructProperty") {
+                auto* sp = static_cast<Unreal::FStructProperty*>(key_prop);
+                auto* inner = sp->GetStruct().Get();
+                if (inner) {
+                    for (auto* leaf : inner->ForEachProperty()) {
+                        if (!leaf) continue;
+                        if (leaf->GetClass().GetName() != L"NameProperty") continue;
+                        auto* fname = reinterpret_cast<Unreal::FName*>(
+                            pair + leaf->GetOffset_Internal());
+                        if (fname) {
+                            auto s = std::wstring(fname->ToString());
+                            if (!s.empty() && s != L"None") {
+                                key_name = s;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            int32_t count = 0;
+            if (val_cls == L"IntProperty") {
+                count = *reinterpret_cast<int32_t*>(pair + layout.ValueOffset);
+            } else if (val_cls == L"Int64Property") {
+                count = static_cast<int32_t>(
+                    *reinterpret_cast<int64_t*>(pair + layout.ValueOffset));
+            }
+
+            if (!key_name.empty()) {
+                out.push_back({HumanizeRichTextId(key_name), count});
+            }
+        }
+        break;
+    }
+    return out;
+}
+
+// Recipe slot click → announce required materials. We don't know the exact
+// UFunction Palworld fires on confirm, so we accept any function whose
+// name contains "click" / "decide" / "press" / "confirm" / "submit" /
+// "activate" (case-insensitive) and falls outside the hover-probe set.
+// Any unmatched call is logged so we can refine if needed.
+void HandleRecipeSlotClick(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    if (!Context) return;
+    if (ClassNameOf(Context) != L"WBP_PalConvertItemMenu_RecipeSlotButton_C") return;
+    auto fn = Stack.Node() ? Stack.Node()->GetName() : std::wstring();
+    if (fn.empty()) return;
+
+    // Skip the hover/probe events handled elsewhere.
+    if (fn == L"GetRecipeId" ||
+        fn == L"BP_OnHovered" ||
+        fn == L"AnmEvent_Focus" ||
+        fn == L"AnmEvent_Hover") return;
+
+    std::wstring fn_lower = fn;
+    for (auto& c : fn_lower) c = static_cast<wchar_t>(std::towlower(c));
+    const bool is_click =
+        fn_lower.find(L"click")    != std::wstring::npos ||
+        fn_lower.find(L"decide")   != std::wstring::npos ||
+        fn_lower.find(L"press")    != std::wstring::npos ||
+        fn_lower.find(L"confirm")  != std::wstring::npos ||
+        fn_lower.find(L"submit")   != std::wstring::npos ||
+        fn_lower.find(L"activate") != std::wstring::npos;
+
+    if (!is_click) {
+        // Discovery log — quiet, fires only on the slot button.
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] recipe-slot ufunc (unmatched): {}\n"), fn);
+        return;
+    }
+
+    // Per-visit dedup: only announce the materials line once per stay on
+    // a slot. CommonButtonBaseClicked fires repeatedly while the slot
+    // stays focused (multiple bound events + Palworld's polling); the
+    // hover handler clears g_click_announced_slot when the user moves
+    // to a different slot, so revisiting re-announces.
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_recipe_speech_mtx);
+        if (Context == g_click_announced_slot) return;
+        g_click_announced_slot = Context;
+    }
+
+    auto mats = ReadRecipeMaterials(Context);
+    auto recipe_name = ResolveRecipeDisplayName(Context);
+    Output::send<LogLevel::Default>(
+        STR("[PalAccess] recipe-click ufunc=\"{}\" name=\"{}\" mats={}\n"),
+        fn, recipe_name, mats.size());
+
+    std::wstring msg;
+    if (!recipe_name.empty()) {
+        msg = recipe_name;
+        msg += L". ";
+    }
+    if (mats.empty()) {
+        msg += L"No required materials";
+    } else {
+        msg += L"Requires ";
+        for (size_t i = 0; i < mats.size(); ++i) {
+            if (i) msg += (i + 1 == mats.size()) ? L" and " : L", ";
+            msg += std::to_wstring(mats[i].count);
+            msg += L" ";
+            msg += mats[i].name;
+        }
+    }
+    // Mark the full click message as last-spoken so the hover handler's
+    // dedup recognises a same-prefix announce ("<name>") as redundant.
+    {
+        std::lock_guard<std::mutex> lock(g_recipe_speech_mtx);
+        g_recipe_last_msg   = msg;
+        g_recipe_last_msg_t = now;
+    }
+    Speech::Get().FocusUpdate(std::wstring_view(msg));
+}
+
+// Pause-menu tab change. WBP_InGameMainMenu_C fires SelectXxxTab when
+// the active tab changes (via RB/LB or click). Announce the new tab so
+// the user immediately knows where they are without having to wait for
+// the widget construction cascade.
+void HandleInGameMenuTabSelect(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    if (!Context) return;
+    if (ClassNameOf(Context) != L"WBP_InGameMainMenu_C") return;
+    auto fn = Stack.Node() ? Stack.Node()->GetName() : std::wstring();
+    std::wstring_view spoken;
+    if      (fn == L"SelectInventoryEquipmentTab") spoken = L"Inventory tab";
+    else if (fn == L"SelectPalTab")                spoken = L"Pal tab";
+    else if (fn == L"SelectTechnologyTab")         spoken = L"Technology tab";
+    else if (fn == L"SelectQuestTab")              spoken = L"Mission list tab";
+    else if (fn == L"SelectMapTab")                spoken = L"Map tab";
+    else if (fn == L"SelectStatusTab")             spoken = L"Status tab";
+    else return;
+    // Per-tab debounce: Palworld may fire Select* multiple times in
+    // quick succession when navigating (e.g. once for input, once for
+    // widget setup). 400 ms catches the burst.
+    static std::mutex                                                              s_tab_mtx;
+    static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> s_tab_at;
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(s_tab_mtx);
+        auto it = s_tab_at.find(std::wstring(spoken));
+        if (it != s_tab_at.end()) {
+            const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second).count();
+            if (since < 400) return;
+        }
+        s_tab_at[std::wstring(spoken)] = now;
+    }
+    Speech::Get().NotifyScreenArrival();
+    Speech::Get().SpeakNow(spoken);
+}
+
+// ---- Inventory slot accessibility ----------------------------------------
+//
+// Two coordinated handlers:
+//   HandleInventoryInfoLifecycle — caches the alive
+//     WBP_InventoryEquipment_ItemInfo_C panel pointer so slot focus can
+//     read its RichText_ItemName for the resolved localized item name.
+//     Cleared on Destruct.
+//   HandleInventorySlotFocus — fires on hover/focus events on
+//     WBP_PalInGameMenuItemSlotButton_C. Reads IsUsableSlot for empty
+//     detection, the slot's own count text-block, and the cached info
+//     panel's name field. Announces "<item name>, <count>" via
+//     FocusUpdate so it interrupts the previous label for snappy nav.
+//     If the slot is empty, just "Empty slot".
+
+// Read the item name text from the cached WBP_InventoryEquipment_ItemInfo_C
+// panel (if it's alive). Walks the panel's properties for the
+// RichText_ItemName ObjectProperty, reads that child's Text field.
+std::wstring ReadInventoryItemName(Unreal::UObject* panel) {
+    if (!panel) return {};
+    auto* cls = panel->GetClassPrivate();
+    if (!cls) return {};
+    for (auto* prop : cls->ForEachPropertyInChain()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+        if (prop->GetName() != L"RichText_ItemName") continue;
+        auto** ptr = prop->ContainerPtrToValuePtr<Unreal::UObject*>(panel);
+        if (!ptr || !*ptr) return {};
+        // Bypass the IsWidgetVisibleForReading gate that
+        // ReadChildTextOrLabel applies — Palworld's RichText reports
+        // Collapsed/Hidden visibility on transient updates even while
+        // it's actually rendering. Read the FText "Text" property
+        // directly.
+        Unreal::UObject* child = *ptr;
+        auto* child_cls = child->GetClassPrivate();
+        if (!child_cls) return {};
+        for (auto* tp : child_cls->ForEachPropertyInChain()) {
+            if (!tp) continue;
+            if (tp->GetClass().GetName() != L"TextProperty") continue;
+            if (tp->GetName() != L"Text") continue;
+            auto* ftext = tp->ContainerPtrToValuePtr<Unreal::FText>(child);
+            if (!ftext) return {};
+            auto raw = std::wstring(ftext->ToString());
+            Output::send<LogLevel::Default>(
+                STR("[PalAccess] inv-name raw RichText_ItemName.Text=\"{}\"\n"),
+                raw);
+            return StripRichTextMarkup(raw);
+        }
+        return {};
+    }
+    return {};
+}
+
+// Call the slot button's GetItemAndNum() UFunction to read the live
+// FPalItemAndNum (the bound slot data). The widget's own Item_Info
+// member is a stale default; only the getter returns the current
+// bound item. Confirmed struct layout from localcc/PalworldModdingKit:
+//   struct FPalItemAndNum {
+//       FPalItemId ItemId;   // { FName StaticId; FPalDynamicItemId DynamicId; }
+//       int32      Num;
+//   };
+// The UFunction's only parameter is the out struct ItemAndNum. We
+// allocate a zero-filled buffer of the function's parameter size,
+// ProcessEvent into it, then walk the buffer via reflection to pull
+// ItemId.StaticId (FName) and Num.
+std::wstring ReadSlotItemViaGetter(Unreal::UObject* slot_button, int32_t* out_count) {
+    if (out_count) *out_count = 0;
+    if (!slot_button) return {};
+    auto* func = slot_button->GetFunctionByName(L"GetItemAndNum");
+    if (!func) return {};
+    const size_t param_size = func->GetPropertiesSize();
+    if (param_size == 0 || param_size > 1024) return {};
+    std::vector<uint8_t> buffer(param_size, 0);
+    slot_button->ProcessEvent(func, buffer.data());
+    // The function has exactly one parameter — the StructProperty
+    // ItemAndNum (FPalItemAndNum). Find it, walk into its ItemId
+    // sub-struct, take StaticId. Also pull Num out.
+    std::wstring name;
+    for (auto* prop : func->ForEachProperty()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"StructProperty") continue;
+        auto* sp = reinterpret_cast<Unreal::FStructProperty*>(prop);
+        auto* inner = sp->GetStruct().Get();
+        if (!inner) continue;
+        auto* struct_data = prop->ContainerPtrToValuePtr<uint8_t>(buffer.data());
+        for (auto* sub : inner->ForEachProperty()) {
+            if (!sub) continue;
+            auto stype = sub->GetClass().GetName();
+            auto sname = sub->GetName();
+            if (stype == L"IntProperty" && sname == L"Num") {
+                auto* num_ptr = sub->ContainerPtrToValuePtr<int32_t>(struct_data);
+                if (num_ptr && out_count) *out_count = *num_ptr;
+                continue;
+            }
+            if (stype == L"StructProperty" && sname == L"ItemId") {
+                auto* sub_sp = reinterpret_cast<Unreal::FStructProperty*>(sub);
+                auto* sub_inner = sub_sp->GetStruct().Get();
+                if (!sub_inner) continue;
+                auto* sub_data = sub->ContainerPtrToValuePtr<uint8_t>(struct_data);
+                if (!sub_data) continue;
+                for (auto* leaf : sub_inner->ForEachProperty()) {
+                    if (!leaf) continue;
+                    if (leaf->GetClass().GetName() != L"NameProperty") continue;
+                    if (leaf->GetName() != L"StaticId") continue;
+                    auto* fname = leaf->ContainerPtrToValuePtr<Unreal::FName>(sub_data);
+                    if (fname) {
+                        auto s = std::wstring(fname->ToString());
+                        if (!s.empty() && s != L"None") name = std::move(s);
+                    }
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    return name;
+}
+
+// Legacy struct-read fallback (kept as backup).
+std::wstring ReadSlotItemFromStruct(Unreal::UObject* slot_button, int32_t* out_count) {
+    if (out_count) *out_count = 0;
+    if (!slot_button) return {};
+    auto* cls = slot_button->GetClassPrivate();
+    if (!cls) return {};
+    for (auto* prop : cls->ForEachPropertyInChain()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"StructProperty") continue;
+        if (prop->GetName() != L"Item Info") continue;
+        auto* sp = reinterpret_cast<Unreal::FStructProperty*>(prop);
+        auto* inner = sp->GetStruct().Get();
+        if (!inner) break;
+        auto* struct_data = prop->ContainerPtrToValuePtr<uint8_t>(slot_button);
+        if (!struct_data) break;
+
+        std::wstring item_name;
+        for (auto* sub : inner->ForEachProperty()) {
+            if (!sub) continue;
+            auto stype = sub->GetClass().GetName();
+            auto sname = sub->GetName();
+            if (stype == L"IntProperty" && sname == L"Num") {
+                auto* num_ptr = sub->ContainerPtrToValuePtr<int32_t>(struct_data);
+                if (num_ptr && out_count) *out_count = *num_ptr;
+                continue;
+            }
+            if (stype == L"StructProperty" && sname == L"ItemId") {
+                auto* sub_sp = reinterpret_cast<Unreal::FStructProperty*>(sub);
+                auto* sub_inner = sub_sp->GetStruct().Get();
+                if (!sub_inner) continue;
+                auto* sub_data = sub->ContainerPtrToValuePtr<uint8_t>(struct_data);
+                if (!sub_data) continue;
+                // First-time discovery: log the ItemId struct's inner
+                // fields so we can refine if needed.
+                static std::once_flag s_id_dump;
+                std::call_once(s_id_dump, [&]{
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess] === ItemId struct ({}) fields ===\n"),
+                        sub_inner->GetName());
+                    int m = 0;
+                    for (auto* leaf : sub_inner->ForEachProperty()) {
+                        if (!leaf) continue;
+                        if (++m > 40) break;
+                        Output::send<LogLevel::Default>(
+                            STR("[PalAccess]   {} {}\n"),
+                            leaf->GetClass().GetName(), leaf->GetName());
+                    }
+                });
+                // Grab the first non-empty NameProperty inside.
+                for (auto* leaf : sub_inner->ForEachProperty()) {
+                    if (!leaf) continue;
+                    if (leaf->GetClass().GetName() != L"NameProperty") continue;
+                    auto* fname = leaf->ContainerPtrToValuePtr<Unreal::FName>(sub_data);
+                    if (fname && fname->ToString() != L"None" && !fname->ToString().empty()) {
+                        item_name = std::wstring(fname->ToString());
+                        break;
+                    }
+                }
+            }
+        }
+        return item_name;
+    }
+    return {};
+}
+
+// Read the visible stack-count text. Tries multiple sources in order:
+//   1. The slot button's BP_PalTextBlock_NumRange child (the in-grid
+//      count overlay; Palworld hides this for single-quantity items)
+//   2. The slot button's "Override Num Count Text" TextProperty
+//      (overlay override; usually empty unless Palworld set it)
+//   3. The ItemInfo panel's Text_ItemNumValue child (the right-pane
+//      detailed count, always resolved on hover)
+// First non-empty result wins.
+std::wstring ReadInventorySlotCount(Unreal::UObject* slot_button,
+                                    Unreal::UObject* info_panel) {
+    auto read_object_child_text = [](Unreal::UObject* owner,
+                                     std::wstring_view child_name) -> std::wstring {
+        if (!owner) return {};
+        auto* cls = owner->GetClassPrivate();
+        if (!cls) return {};
+        for (auto* prop : cls->ForEachPropertyInChain()) {
+            if (!prop) continue;
+            if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+            if (prop->GetName() != child_name) continue;
+            auto** ptr = prop->ContainerPtrToValuePtr<Unreal::UObject*>(owner);
+            if (!ptr || !*ptr) return {};
+            return ReadChildTextOrLabel(*ptr);
+        }
+        return {};
+    };
+
+    if (slot_button) {
+        if (auto t = read_object_child_text(slot_button, L"BP_PalTextBlock_NumRange");
+            !t.empty()) return t;
+        // Override Num Count Text — TextProperty directly on the slot button.
+        auto* cls = slot_button->GetClassPrivate();
+        if (cls) {
+            for (auto* prop : cls->ForEachPropertyInChain()) {
+                if (!prop) continue;
+                if (prop->GetClass().GetName() != L"TextProperty") continue;
+                if (prop->GetName() != L"Override Num Count Text") continue;
+                auto* ftext = prop->ContainerPtrToValuePtr<Unreal::FText>(slot_button);
+                if (ftext) {
+                    auto s = std::wstring(ftext->ToString());
+                    if (!s.empty()) return s;
+                }
+                break;
+            }
+        }
+    }
+    if (info_panel) {
+        if (auto t = read_object_child_text(info_panel, L"Text_ItemNumValue");
+            !t.empty()) return t;
+    }
+    return {};
+}
+
+// Read the IsUsableSlot bool property on the slot button. True when the
+// slot holds an item that can be picked / equipped. Returns false on
+// any failure path (we'd rather not announce an item name for an empty
+// slot than vice-versa).
+bool SlotIsUsable(Unreal::UObject* slot_button) {
+    if (!slot_button) return false;
+    auto* cls = slot_button->GetClassPrivate();
+    if (!cls) return false;
+    for (auto* prop : cls->ForEachPropertyInChain()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"BoolProperty") continue;
+        if (prop->GetName() != L"IsUsableSlot") continue;
+        auto* val = prop->ContainerPtrToValuePtr<bool>(slot_button);
+        return val && *val;
+    }
+    return false;
+}
+
+// Call WBP_PalInGameMenuItemSlotButton_C::GetTargetSlot via ProcessEvent
+// to retrieve the bound UPalItemSlot. The slot widget's own Item_Info
+// member is a stale display copy (especially on the Equipment subtab
+// where it never gets filled); GetTargetSlot returns the live data
+// source, which we then ask for its ItemId.
+//
+// Confirmed flow from log + reverse-engineering research:
+//   slot_button.GetTargetSlot() -> UPalItemSlot*
+//   UPalItemSlot.GetItemId()    -> FPalItemId { FName StaticId; ... }
+//   UPalItemSlot.GetStackCount() -> int32
+// Walk the class chain looking for a UFunction by name. Built-in
+// GetFunctionByName returned null for GetTargetSlot in this Palworld
+// build even though the function exists on the parent class
+// WBP_PalItemSlotButtonBase_C (confirmed via class-chain dump). This
+// iterator is paranoid and walks until we hit base UObject/Widget.
+Unreal::UFunction* FindFunctionInChain(Unreal::UObject* obj,
+                                       std::wstring_view fname) {
+    if (!obj) return nullptr;
+    auto* cls = obj->GetClassPrivate();
+    while (cls) {
+        for (auto* f : cls->ForEachFunction()) {
+            if (f && f->GetName() == fname) return f;
+        }
+        auto* super = cls->GetSuperStruct();
+        cls = reinterpret_cast<Unreal::UClass*>(super);
+        if (!cls) break;
+        auto cn = cls->GetName();
+        if (cn == L"UserWidget" || cn == L"CommonUserWidget" ||
+            cn == L"Widget"     || cn == L"Object") break;
+    }
+    return nullptr;
+}
+
+Unreal::UObject* CallGetTargetSlot(Unreal::UObject* slot_button) {
+    static std::once_flag s_step_log;
+    std::call_once(s_step_log, [&]{
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] CallGetTargetSlot first call slot={:p}\n"),
+            static_cast<void*>(slot_button));
+        // Dump every UFunction we can find on the slot button's class
+        // chain so we can see the exact name + which class owns it.
+        if (auto* cls = slot_button->GetClassPrivate()) {
+            Output::send<LogLevel::Default>(
+                STR("[PalAccess] slot class chain functions:\n"));
+            for (auto* uc = cls; uc; ) {
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess]   class {}\n"), uc->GetName());
+                for (auto* f : uc->ForEachFunction()) {
+                    if (!f) continue;
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess]     fn {}\n"), f->GetName());
+                }
+                // Walk up the parent chain.
+                auto* super = uc->GetSuperStruct();
+                uc = reinterpret_cast<Unreal::UClass*>(super);
+                if (!uc) break;
+                if (uc->GetName() == L"UserWidget" ||
+                    uc->GetName() == L"CommonUserWidget" ||
+                    uc->GetName() == L"Widget" ||
+                    uc->GetName() == L"Object") break;
+            }
+        }
+    });
+    if (!slot_button) return nullptr;
+    auto* func = FindFunctionInChain(slot_button, L"GetTargetSlot");
+    static std::once_flag s_func_log;
+    std::call_once(s_func_log, [&]{
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] CallGetTargetSlot func={:p} (chain-walked)\n"),
+            static_cast<void*>(func));
+    });
+    if (!func) return nullptr;
+    const size_t param_size = func->GetPropertiesSize();
+    static std::once_flag s_size_log;
+    std::call_once(s_size_log, [&]{
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] CallGetTargetSlot param_size={}\n"), param_size);
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] === GetTargetSlot parameters ===\n"));
+        for (auto* prop : func->ForEachProperty()) {
+            if (!prop) continue;
+            Output::send<LogLevel::Default>(
+                STR("[PalAccess]   {} {}\n"),
+                prop->GetClass().GetName(), prop->GetName());
+        }
+    });
+    if (param_size == 0 || param_size > 256) return nullptr;
+    std::vector<uint8_t> buffer(param_size, 0);
+    slot_button->ProcessEvent(func, buffer.data());
+    // The return is a single ObjectProperty (the UPalItemSlot pointer).
+    for (auto* prop : func->ForEachProperty()) {
+        if (!prop) continue;
+        if (prop->GetClass().GetName() != L"ObjectProperty") continue;
+        auto** ret = prop->ContainerPtrToValuePtr<Unreal::UObject*>(buffer.data());
+        if (ret && *ret) {
+            static std::once_flag s_ret_log;
+            std::call_once(s_ret_log, [&]{
+                auto* rcls = (*ret)->GetClassPrivate();
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess] GetTargetSlot returned class={}\n"),
+                    rcls ? rcls->GetName() : L"<null>");
+            });
+            return *ret;
+        }
+    }
+    static std::once_flag s_noret_log;
+    std::call_once(s_noret_log, [&]{
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] GetTargetSlot returned null/empty\n"));
+    });
+    return nullptr;
+}
+
+// Read item id + stack count directly from UPalItemSlot's replicated
+// UPROPERTYs. Confirmed layout from PalItemSlot.h (PalworldModdingKit)
+// + runtime property dump:
+//   IntProperty    StackCount
+//   StructProperty ItemId        (FPalItemId)
+//     NameProperty StaticId      <-- the live item id (e.g. "Wood")
+//     StructProperty DynamicId
+// Direct reads are reliable; UFunction calls (GetItemId, GetStackCount)
+// were unreliable in this Palworld build — likely they're plain C++
+// methods, not UFUNCTION-tagged, so they don't show up via the
+// blueprint-call path. The properties themselves are always exposed.
+std::wstring ReadFromTargetSlot(Unreal::UObject* target_slot, int32_t* out_count) {
+    if (out_count) *out_count = 0;
+    if (!target_slot) return {};
+    auto* cls = target_slot->GetClassPrivate();
+    if (!cls) return {};
+
+    std::wstring name;
+    for (auto* prop : cls->ForEachPropertyInChain()) {
+        if (!prop) continue;
+        auto ptype = prop->GetClass().GetName();
+        auto pname = prop->GetName();
+
+        // StackCount: replicated IntProperty.
+        if (ptype == L"IntProperty" && pname == L"StackCount") {
+            auto* val = prop->ContainerPtrToValuePtr<int32_t>(target_slot);
+            if (val && out_count) *out_count = *val;
+            continue;
+        }
+
+        // ItemId: replicated StructProperty FPalItemId. Walk it for
+        // StaticId (NameProperty).
+        if (ptype == L"StructProperty" && pname == L"ItemId") {
+            auto* sp = reinterpret_cast<Unreal::FStructProperty*>(prop);
+            auto* inner = sp->GetStruct().Get();
+            if (!inner) continue;
+            auto* struct_data = prop->ContainerPtrToValuePtr<uint8_t>(target_slot);
+            if (!struct_data) continue;
+            for (auto* leaf : inner->ForEachProperty()) {
+                if (!leaf) continue;
+                if (leaf->GetClass().GetName() != L"NameProperty") continue;
+                if (leaf->GetName() != L"StaticId") continue;
+                auto* fname = leaf->ContainerPtrToValuePtr<Unreal::FName>(struct_data);
+                if (fname) {
+                    auto raw = std::wstring(fname->ToString());
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess] target-slot StaticId raw=\"{}\"\n"), raw);
+                    if (!raw.empty() && raw != L"None") name = std::move(raw);
+                }
+                break;
+            }
+        }
+    }
+    return name;
+}
+
+// Diagnostic: one-shot dump of WBP_InventoryEquipment_C::SetCurrentSlot
+// parameters. This UFunction fires every time Palworld binds a slot
+// for display (every arrow press in the menu). If its parameter struct
+// contains the slot's FName / display text, that's the authoritative
+// path — read from there instead of the destination panel's RichText.
+void HandleSetCurrentSlotDump(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    if (!Context) return;
+    auto cn = ClassNameOf(Context);
+    auto fn = Stack.Node() ? Stack.Node()->GetName() : std::wstring();
+    if (fn != L"SetCurrentSlot") return;
+    static std::once_flag s_once;
+    std::call_once(s_once, [&]{
+        Output::send<LogLevel::Default>(
+            STR("[PalAccess] === {}::SetCurrentSlot parameters ===\n"), cn);
+        if (auto* func = Stack.Node()) {
+            for (auto* prop : func->ForEachProperty()) {
+                if (!prop) continue;
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess]   {} {}\n"),
+                    prop->GetClass().GetName(), prop->GetName());
+            }
+        }
+    });
+    // Also walk one StructProperty parameter level deep (if any) — the
+    // slot data shape we want is likely nested.
+    static std::once_flag s_struct_once;
+    std::call_once(s_struct_once, [&]{
+        if (auto* func = Stack.Node()) {
+            for (auto* prop : func->ForEachProperty()) {
+                if (!prop) continue;
+                if (prop->GetClass().GetName() != L"StructProperty") continue;
+                auto* sp = reinterpret_cast<Unreal::FStructProperty*>(prop);
+                auto* inner = sp->GetStruct().Get();
+                if (!inner) continue;
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess]   [param struct {} fields]\n"),
+                    inner->GetName());
+                for (auto* sub : inner->ForEachProperty()) {
+                    if (!sub) continue;
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess]     {} {}\n"),
+                        sub->GetClass().GetName(), sub->GetName());
+                }
+            }
+        }
+    });
+}
+
+void HandleInventoryInfoLifecycle(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    if (!Context) return;
+    auto cn = ClassNameOf(Context);
+    if (cn != L"WBP_InventoryEquipment_ItemInfo_C") return;
+    if (FunctionNameIs(Stack, L"Construct") ||
+        FunctionNameIs(Stack, L"OnInitialized") ||
+        FunctionNameIs(Stack, L"Change Display Mode")) {
+        std::lock_guard<std::mutex> lock(g_inv_mtx);
+        g_inv_item_info = Context;
+    } else if (FunctionNameIs(Stack, L"Destruct")) {
+        std::lock_guard<std::mutex> lock(g_inv_mtx);
+        if (g_inv_item_info == Context) g_inv_item_info = nullptr;
+    }
+}
+
+void HandleInventorySlotFocus(Unreal::UObject* Context, Unreal::FFrame& Stack) {
+    if (!Context) return;
+    auto cn = ClassNameOf(Context);
+    if (cn != L"WBP_PalInGameMenuItemSlotButton_C") return;
+    auto fn = Stack.Node() ? Stack.Node()->GetName() : std::wstring();
+    if (fn != L"AnmEvent_Focus" &&
+        fn != L"BP_OnHovered"    &&
+        fn != L"AnmEvent_Hover") return;
+
+    Output::send<LogLevel::Default>(
+        STR("[PalAccess] inv-focus event={} ctx={:p}\n"),
+        fn, static_cast<void*>(Context));
+
+    // Slot-pointer dedup: a single keyboard/controller focus on a slot
+    // fires up to three events (AnmEvent_Focus, BP_OnHovered,
+    // AnmEvent_Hover) within ~10 ms. They all carry the same Context
+    // pointer. The ItemInfo panel may update between them, which makes
+    // the computed message string differ each time — message dedup
+    // misses those. Pointer dedup catches all three cleanly. A user
+    // arrowing away to a different slot is a different Context, so it
+    // fires normally.
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_inv_mtx);
+        if (Context == g_inv_last_slot &&
+            now - g_inv_last_slot_t < std::chrono::milliseconds(400)) return;
+        g_inv_last_slot   = Context;
+        g_inv_last_slot_t = now;
+    }
+
+    // Empty slot — short announce, skip name lookup entirely.
+    const bool usable = SlotIsUsable(Context);
+    if (!usable) {
+        Speech::Get().FocusUpdate(L"Empty slot");
+        return;
+    }
+
+    Unreal::UObject* info_panel = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_inv_mtx);
+        info_panel = g_inv_item_info;
+    }
+    // Validate the cached pointer before dereferencing.
+    if (info_panel) {
+        auto* item = info_panel->GetObjectItem();
+        if (!Unreal::UObjectArray::IsValid(item, /*evenIfPendingKill=*/false)) {
+            std::lock_guard<std::mutex> lock(g_inv_mtx);
+            g_inv_item_info = nullptr;
+            info_panel = nullptr;
+        }
+    }
+    // Cache-miss fallback: scan the live UObject array for an alive
+    // WBP_InventoryEquipment_ItemInfo_C. Construct/Destruct ordering
+    // can leave the cache stale across menu reopens.
+    if (!info_panel) {
+        Unreal::UObjectGlobals::ForEachUObject(
+            [&](Unreal::UObject* obj, int32_t, int32_t) -> LoopAction {
+                if (info_panel || !obj) return LoopAction::Continue;
+                if (obj->GetName().starts_with(L"Default__")) return LoopAction::Continue;
+                auto* cls = obj->GetClassPrivate();
+                if (!cls) return LoopAction::Continue;
+                if (cls->GetName() == L"WBP_InventoryEquipment_ItemInfo_C") {
+                    info_panel = obj;
+                    return LoopAction::Break;
+                }
+                return LoopAction::Continue;
+            });
+        if (info_panel) {
+            std::lock_guard<std::mutex> lock(g_inv_mtx);
+            g_inv_item_info = info_panel;
+        }
+    }
+    // Primary path: GetTargetSlot() -> UPalItemSlot. Read ItemId
+    // (StaticId FName) and StackCount directly as UPROPERTYs from the
+    // returned slot. This is the same data Palworld replicates over
+    // the network and what its own widgets render from.
+    int32_t struct_count = 0;
+    std::wstring raw_id;
+    if (auto* target = CallGetTargetSlot(Context)) {
+        raw_id = ReadFromTargetSlot(target, &struct_count);
+    }
+    // Fallbacks for builds where UPalItemSlot isn't directly accessible.
+    if (raw_id.empty()) raw_id = ReadSlotItemViaGetter(Context, &struct_count);
+    if (raw_id.empty()) raw_id = ReadSlotItemFromStruct(Context, &struct_count);
+
+    // True-empty detection: per UPalItemSlot.h, StaticId "None" with
+    // StackCount 0 means the slot has no bound item. `IsUsableSlot`
+    // only means "this slot can hold an item" — empty grid cells in
+    // the inventory still report IsUsableSlot=true. Treat None-id /
+    // zero-count as actually empty.
+    if (raw_id.empty() && struct_count <= 0) {
+        Speech::Get().FocusUpdate(L"Empty slot");
+        return;
+    }
+
+    std::wstring name;
+    if (!raw_id.empty()) name = HumanizeRichTextId(raw_id);
+    // Last-resort: info panel's RichText_ItemName (rarely needed now).
+    if (name.empty()) name = ReadInventoryItemName(info_panel);
+    // Count: prefer the live UPalItemSlot.StackCount value.
+    std::wstring count;
+    if (struct_count > 0) count = std::to_wstring(struct_count);
+    else count = ReadInventorySlotCount(Context, info_panel);
+    Output::send<LogLevel::Default>(
+        STR("[PalAccess] inv-focus probe info_panel={:p} name=\"{}\" count=\"{}\"\n"),
+        static_cast<void*>(info_panel), name, count);
+
+    // One-shot dump of the slot button's "Item Info" struct fields the
+    // first time a name read fails. Knowing the struct layout lets the
+    // next iteration read the item id directly from the slot, bypassing
+    // the (sometimes-stale) ItemInfo panel entirely.
+    if (name.empty()) {
+        static std::once_flag s_iteminfo_dump;
+        std::call_once(s_iteminfo_dump, [&]{
+            auto* cls = Context->GetClassPrivate();
+            if (!cls) return;
+            for (auto* prop : cls->ForEachPropertyInChain()) {
+                if (!prop) continue;
+                if (prop->GetClass().GetName() != L"StructProperty") continue;
+                if (prop->GetName() != L"Item Info") continue;
+                auto* sp = reinterpret_cast<Unreal::FStructProperty*>(prop);
+                auto* inner = sp->GetStruct().Get();
+                if (!inner) break;
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess] === slot Item Info struct ({}) fields ===\n"),
+                    inner->GetName());
+                int n = 0;
+                for (auto* sub : inner->ForEachProperty()) {
+                    if (!sub) continue;
+                    if (++n > 60) break;
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess]   {} {}\n"),
+                        sub->GetClass().GetName(), sub->GetName());
+                }
+                break;
+            }
+            // Also dump GetItemAndNum's parameter list, since calling
+            // that UFunction is another route to read item id + count.
+            if (auto* func = Context->GetFunctionByName(L"GetItemAndNum")) {
+                Output::send<LogLevel::Default>(
+                    STR("[PalAccess] === GetItemAndNum parameters ===\n"));
+                for (auto* prop : func->ForEachProperty()) {
+                    if (!prop) continue;
+                    Output::send<LogLevel::Default>(
+                        STR("[PalAccess]   {} {}\n"),
+                        prop->GetClass().GetName(), prop->GetName());
+                }
+            }
+        });
+    }
+    if (IsPlaceholderText(name) || IsNotificationPlaceholder(name)) name.clear();
+
+    // Strip leading zeros from the count; "000000" is Palworld's
+    // unbound-widget placeholder.
+    {
+        size_t first_nz = count.find_first_not_of(L'0');
+        if (first_nz == std::wstring::npos) count.clear();
+        else if (first_nz > 0) count = count.substr(first_nz);
+    }
+    // Treat the placeholder-name string as empty.
+    if (IsPlaceholderText(name) || IsNotificationPlaceholder(name)) name.clear();
+
+    std::wstring msg;
+    if (!name.empty()) {
+        std::wstring item_count = count.empty() ? std::wstring(L"1") : count;
+        msg  = name;
+        msg += L", ";
+        msg += item_count;
+    } else {
+        // No name yet — speak whatever we have so the player at least
+        // hears that they moved onto a non-empty slot. The next hover
+        // (once Palworld binds the info panel) will speak the real
+        // name and dedup-skip if identical.
+        std::wstring item_count = count.empty() ? std::wstring(L"1") : count;
+        msg = L"Item, " + item_count;
+    }
+
+    // Name+count dedup with a generous 1200 ms window. When a player
+    // has several slots of the same single-quantity item (multiple
+    // Wooden Clubs, etc.), Palworld hides the count widget so the
+    // message is just the bare name — and the user perceives every
+    // arrow press as a duplicate. Items with distinct counts produce
+    // distinct messages ("Red Berries, 5" vs "Red Berries, 12") which
+    // bypass the dedup naturally; only truly-identical announces are
+    // suppressed. A user lingering on a slot >1.2 s and arrowing back
+    // hears it re-announce.
+    // Only apply name-string dedup when the name actually resolved.
+    // Otherwise every slot would produce "Item, 1" and dedup-skip
+    // after the first, leaving the user with silence.
+    if (!name.empty()) {
+        std::lock_guard<std::mutex> lock(g_inv_mtx);
+        if (msg == g_inv_last_msg &&
+            now - g_inv_last_msg_t < std::chrono::milliseconds(1200)) {
+            Output::send<LogLevel::Default>(
+                STR("[PalAccess] inv-focus dedup-skip \"{}\"\n"), msg);
+            return;
+        }
+        g_inv_last_msg   = msg;
+        g_inv_last_msg_t = now;
+    }
+    Output::send<LogLevel::Default>(
+        STR("[PalAccess] inv-focus ANNOUNCE \"{}\"\n"), msg);
+    Speech::Get().FocusUpdate(std::wstring_view(msg));
 }
 
 // System notifications — level-up, quest add/complete, achievements,
@@ -1820,6 +3273,12 @@ PALACCESS_UFUNC_HOOK(Hooks::OnPostScriptFunction) {
     HandleConstructionItemFocus(Context, Stack);
     HandleConstructionMaterialRow(Context, Stack);
     HandleConstructionTabSelect(Context, Stack);
+    HandleInventoryInfoLifecycle(Context, Stack);
+    HandleInventorySlotFocus(Context, Stack);
+    HandleRecipeSlotFocus(Context, Stack);
+    HandleRecipeSlotClick(Context, Stack);
+    HandleSetCurrentSlotDump(Context, Stack);
+    HandleInGameMenuTabSelect(Context, Stack);
 }
 
 // Legacy placeholder dispatchers kept as no-ops — declared in the header so the
